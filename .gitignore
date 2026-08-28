@@ -1,0 +1,15 @@
+# devkitPro build output
+build_nx/
+*.elf
+*.nro
+*.nacp
+*.o
+*.d
+*.map
+
+# Local scratch, extracted APK material and staged SD-card data.
+# None of it is redistributable: supply your own copy of the game.
+.tmp/
+.build-tmp/
+build/
+sd_bundle/
