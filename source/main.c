@@ -2287,6 +2287,35 @@ int main(int argc, char **argv) {
     putenv(rust_backtrace_env);
   }
 
+  /* NVK/Mesa env vars for the resource-download device-lost investigation
+   * (vkQueueSubmit #1001 returns VK_ERROR_DEVICE_LOST after
+   * FilesDownloadPipe StartDownload).  NVK is statically linked into this NRO
+   * and reads the same environ; getenv_fake (libc_shim.c) passes unknown vars
+   * through to the real getenv, so these reach the driver without code changes
+   * to the Vulkan path.
+   *
+   * NVK_DEBUG=push_sync serializes each push-buffer submission: if the
+   * device-lost disappears under it, the hang is timing/watchdog-induced
+   * (download-burst overrunning the nvhost channel) and a fence-throttle in
+   * the existing nx_vkQueueSubmit hook is the productionizable fix.  If it
+   * persists on the same submit, the offending command buffer is
+   * deterministic and Mesa-side.  push_dump captures that buffer to
+   * stderr.txt (bound above).
+   *
+   * MESA_VK_ABORT_ON_DEVICE_LOST turns the first device-lost into a SIGABRT
+   * instead of a silent -4 return the game then mishandles; combined with
+   * RUST_BACKTRACE=1 this yields a backtrace at the failing submit. */
+  {
+    static char nvk_debug_env[] = "NVK_DEBUG=push_sync";
+    static char nvk_dump_env[] = "NVK_DEBUG=push_sync,push_dump";
+    static char abort_env[] = "MESA_VK_ABORT_ON_DEVICE_LOST=1";
+    /* push_sync alone first; add push_dump on a follow-up build if the hang
+     * survives serialization, to keep stderr.txt from filling on good runs. */
+    (void)nvk_dump_env;
+    putenv(nvk_debug_env);
+    putenv(abort_env);
+  }
+
   startup_status_begin("Validating the Android client");
   if (chdir(DATA_ROOT) != 0)
     fatal_error("Could not enter %s. Copy the staged game directory to the SD card.",
