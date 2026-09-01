@@ -637,7 +637,9 @@ static int preflight_one(so_module *mod, const Elf64_Rela *rel, void *opaque) {
     return 0;
   if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
     return 0;
-  return preflight_fail(ctx, "unresolved import '%s'", name, 0);
+  if (ctx->error && ctx->error_cap)
+    snprintf(ctx->error, ctx->error_cap, "unresolved import '%s'", name);
+  return -1;
 }
 
 int so_preflight_imports(so_module *mod, so_symbol_resolver resolver,

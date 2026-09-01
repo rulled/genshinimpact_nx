@@ -27,6 +27,13 @@
 #define OC_HEAP_DONOR_GROW_BYTES    ((size_t)256 * 1024 * 1024)
 #define OC_HEAP_DONOR_SHRINK_BYTES  OC_HEAP_DONOR_GROW_BYTES
 #define SO_REGION_BYTES     ((size_t) 416 * 1024 * 1024)
+/* Public host allocations at or above this size are served straight from the
+ * reclaimable sparse pool instead of newlib's dlmalloc.  Newlib-internal
+ * allocations (open_memstream, FILE glue) bypass every wrapper and die with
+ * ENOMEM once dlmalloc saturates, so the primary heap must stay small.
+ * Histogram data from the login-burst NAK panic showed 472 MiB peak-live in
+ * dlmalloc, with 465 MiB in >=16 MiB blocks while the pool held GiBs free. */
+#define OC_BROKER_LARGE_ALLOC_BYTES ((size_t)1 * 1024 * 1024)
 
 #define SS_PACKAGE        "com.miHoYo.GenshinImpact"
 #define SS_VERSION_CODE   1206

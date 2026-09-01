@@ -966,8 +966,75 @@ __eglMustCastToProperFunctionPointerType nx_eglGetProcAddress_stub(
   return (__eglMustCastToProperFunctionPointerType)result;
 }
 
-/* Weak standard names cover Unity's direct query imports when the NVK archive
- * omits them.  CRI relocations should bind the explicit nx_* functions above. */
+/* Weak standard query names cover Unity's direct imports. The additional
+ * strong aliases below are external-backend-only: they satisfy SDL2's static
+ * EGL loader without linking the incompatible switch-mesa libEGL. CRI
+ * relocations continue to bind the explicit nx_* functions above. */
+#ifdef GENSHIN_EXTERNAL_LOADERLESS_NVK
+EGLDisplay eglGetDisplay(EGLNativeDisplayType display) {
+  return nx_eglGetDisplay_stub(display);
+}
+
+EGLDisplay eglGetPlatformDisplay(
+    EGLenum platform, void *native_display, const EGLAttrib *attributes) {
+  (void)platform;
+  (void)attributes;
+  return nx_eglGetDisplay_stub((EGLNativeDisplayType)native_display);
+}
+
+EGLBoolean eglInitialize(
+    EGLDisplay display, EGLint *major, EGLint *minor) {
+  return nx_eglInitialize_stub(display, major, minor);
+}
+
+EGLBoolean eglTerminate(EGLDisplay display) {
+  return nx_eglTerminate_stub(display);
+}
+
+EGLBoolean eglChooseConfig(
+    EGLDisplay display, const EGLint *attributes, EGLConfig *configs,
+    EGLint config_size, EGLint *config_count) {
+  return nx_eglChooseConfig_stub(display, attributes, configs, config_size,
+                                 config_count);
+}
+
+EGLBoolean eglGetConfigAttrib(
+    EGLDisplay display, EGLConfig config, EGLint attribute, EGLint *value) {
+  return nx_eglGetConfigAttrib_stub(display, config, attribute, value);
+}
+
+EGLContext eglCreateContext(
+    EGLDisplay display, EGLConfig config, EGLContext shared_context,
+    const EGLint *attributes) {
+  return nx_eglCreateContext_stub(display, config, shared_context, attributes);
+}
+
+EGLSurface eglCreatePbufferSurface(
+    EGLDisplay display, EGLConfig config, const EGLint *attributes) {
+  return nx_eglCreatePbufferSurface_stub(display, config, attributes);
+}
+
+EGLSurface eglCreateWindowSurface(
+    EGLDisplay display, EGLConfig config, EGLNativeWindowType window,
+    const EGLint *attributes) {
+  return nx_eglCreateWindowSurface_stub(display, config, window, attributes);
+}
+
+EGLBoolean eglDestroyContext(
+    EGLDisplay display, EGLContext context) {
+  return nx_eglDestroyContext_stub(display, context);
+}
+
+EGLBoolean eglDestroySurface(
+    EGLDisplay display, EGLSurface surface) {
+  return nx_eglDestroySurface_stub(display, surface);
+}
+
+EGLBoolean eglMakeCurrent(
+    EGLDisplay display, EGLSurface draw, EGLSurface read, EGLContext context) {
+  return nx_eglMakeCurrent_stub(display, draw, read, context);
+}
+
 __attribute__((weak)) EGLContext eglGetCurrentContext(void) {
   return nx_eglGetCurrentContext_stub();
 }
@@ -985,3 +1052,45 @@ __attribute__((weak)) EGLBoolean eglSurfaceAttrib(
   EGLDisplay display, EGLSurface surface, EGLint attribute, EGLint value) {
   return nx_eglSurfaceAttrib_stub(display, surface, attribute, value);
 }
+
+EGLBoolean eglSwapBuffers(
+    EGLDisplay display, EGLSurface surface) {
+  return nx_eglSwapBuffers_stub(display, surface);
+}
+
+EGLBoolean eglSwapInterval(
+    EGLDisplay display, EGLint interval) {
+  return nx_eglSwapInterval_stub(display, interval);
+}
+
+EGLint eglGetError(void) {
+  return nx_eglGetError_stub();
+}
+
+const char *eglQueryString(
+    EGLDisplay display, EGLint name) {
+  return nx_eglQueryString_stub(display, name);
+}
+
+__eglMustCastToProperFunctionPointerType
+eglGetProcAddress(const char *name) {
+  return nx_eglGetProcAddress_stub(name);
+}
+
+EGLBoolean eglBindAPI(EGLenum api) {
+  return api == EGL_OPENGL_ES_API ? EGL_TRUE : egl_failure(EGL_BAD_PARAMETER);
+}
+
+EGLenum eglQueryAPI(void) {
+  return EGL_OPENGL_ES_API;
+}
+
+EGLBoolean eglWaitNative(EGLint engine) {
+  (void)engine;
+  return EGL_TRUE;
+}
+
+EGLBoolean eglWaitGL(void) {
+  return EGL_TRUE;
+}
+#endif

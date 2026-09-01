@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -26,8 +27,11 @@
 #include "imports.h"
 #include "jni_fake.h"
 #include "libc_shim.h"
+#include "memory_broker.h"
 #include "opensles.h"
+#include "panic_capture.h"
 #include "plugin_loader.h"
+#include "sbrk_extend.h"
 #include "so_util.h"
 #include "unity_entrypoints.h"
 #include "unity_jni.h"
@@ -917,7 +921,7 @@ static void initialize_sparse_arena(void) {
   (void)svcGetInfo(&alias_size, InfoType_AliasRegionSize,
                    CUR_PROCESS_HANDLE, 0);
   if (R_FAILED(svcGetInfo(&alias_extra, InfoType_AliasRegionExtraSize,
-                          CUR_PROCESS_HANDLE, 0)))
+                           CUR_PROCESS_HANDLE, 0)))
     alias_extra = 0;
   (void)svcGetInfo(&stack_address, InfoType_StackRegionAddress,
                    CUR_PROCESS_HANDLE, 0);
@@ -929,7 +933,53 @@ static void initialize_sparse_arena(void) {
                    CUR_PROCESS_HANDLE, 0);
   (void)svcGetInfo(&system_resource, InfoType_SystemResourceSizeTotal,
                    CUR_PROCESS_HANDLE, 0);
-  if (!prepared) return;
+  if (!prepared) {
+    extern const char *g_oc_arena_failure_stage;
+    const NxMemoryBackingBackend backend = nx_memory_backing_backend();
+    const size_t dyn_target = nx_dynamic_arena_target_bytes();
+    FILE *df = fopen(DATA_ROOT "/arena_debug.txt", "w");
+    if (df) {
+      fprintf(df, "failure_stage=%s\n", g_oc_arena_failure_stage);
+      fprintf(df, "backend=%d system_resource=0x%llx\n",
+              (int)backend, (unsigned long long)system_resource);
+      fprintf(df, "aslr_addr=0x%llx aslr_size=0x%llx (%llu MiB)\n",
+              (unsigned long long)aslr_address,
+              (unsigned long long)aslr_size,
+              (unsigned long long)(aslr_size / (1024 * 1024)));
+      fprintf(df, "alias_addr=0x%llx alias_size=0x%llx (%llu MiB) extra=0x%llx\n",
+              (unsigned long long)alias_address,
+              (unsigned long long)alias_size,
+              (unsigned long long)(alias_size / (1024 * 1024)),
+              (unsigned long long)alias_extra);
+      fprintf(df, "stack_addr=0x%llx stack_size=0x%llx (%llu MiB)\n",
+              (unsigned long long)stack_address,
+              (unsigned long long)stack_size,
+              (unsigned long long)(stack_size / (1024 * 1024)));
+      fprintf(df, "donor_capacity=0x%zx (%zu MiB) donor_active=0x%zx (%zu MiB)\n",
+              g_heap_donor_capacity, g_heap_donor_capacity / (1024 * 1024),
+              g_heap_donor_active_bytes, g_heap_donor_active_bytes / (1024 * 1024));
+      fprintf(df, "oc_dynamic_arena_bytes=0x%zx (%zu MiB)\n",
+              (size_t)OC_DYNAMIC_ARENA_BYTES,
+              (size_t)OC_DYNAMIC_ARENA_BYTES / (1024 * 1024));
+      fprintf(df, "unity_slab_bytes=0x%llx (%llu MiB)\n",
+              (unsigned long long)GENSHIN_UNITY_SLAB_MAP_BYTES,
+              (unsigned long long)(GENSHIN_UNITY_SLAB_MAP_BYTES / (1024 * 1024)));
+      fprintf(df, "large_search=0x%llx (%llu MiB)\n",
+              (unsigned long long)((u64)OC_DYNAMIC_ARENA_BYTES +
+               (u64)GENSHIN_UNITY_SLAB_MAP_BYTES + MMAP_ARENA_ALIGN),
+              (unsigned long long)(((u64)OC_DYNAMIC_ARENA_BYTES +
+               (u64)GENSHIN_UNITY_SLAB_MAP_BYTES + MMAP_ARENA_ALIGN) /
+               (1024 * 1024)));
+      fprintf(df, "aslr_threshold=0x%llx (%llu GiB)\n",
+              (unsigned long long)((u64)2 * 1024 * 1024 * 1024),
+              (unsigned long long)2);
+      fprintf(df, "dyn_target=0x%zx (%zu MiB)\n",
+              dyn_target, dyn_target / (1024 * 1024));
+      fprintf(df, "oc_want=%d\n", g_oc_want);
+      fclose(df);
+    }
+    return;
+  }
   g_oc_want = 2;
 }
 
@@ -1846,9 +1896,261 @@ static void initialize_network_state(void) {
   g_net_on = socket_started != 0;
 }
 
+static volatile sig_atomic_t g_crash_signal = -1;
+static volatile sig_atomic_t g_render_frame = -1;
+static volatile sig_atomic_t g_render_in_progress;
+
+static size_t crash_report_append_text(char *report, size_t capacity,
+                                       size_t length, const char *text) {
+  while (*text && length < capacity) report[length++] = *text++;
+  return length;
+}
+
+static size_t crash_report_append_int(char *report, size_t capacity,
+                                      size_t length, int value) {
+  char digits[16];
+  size_t count = 0;
+  unsigned magnitude = (unsigned)value;
+  if (value < 0) {
+    if (length < capacity) report[length++] = '-';
+    magnitude = 0u - magnitude;
+  }
+  do {
+    digits[count++] = (char)('0' + magnitude % 10u);
+    magnitude /= 10u;
+  } while (magnitude && count < sizeof(digits));
+  while (count && length < capacity) report[length++] = digits[--count];
+  return length;
+}
+
+static void crash_signal_handler(int sig) {
+  g_crash_signal = sig;
+  const int fd = open(DATA_ROOT "/crash_signal.txt",
+                      O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd >= 0) {
+    char report[96];
+    size_t length = crash_report_append_text(report, sizeof(report), 0,
+                                             "signal=");
+    length = crash_report_append_int(report, sizeof(report), length, sig);
+    length = crash_report_append_text(report, sizeof(report), length,
+                                      " frame=");
+    length = crash_report_append_int(report, sizeof(report), length,
+                                     g_render_frame);
+    length = crash_report_append_text(report, sizeof(report), length,
+                                      " in_render=");
+    length = crash_report_append_int(report, sizeof(report), length,
+                                     g_render_in_progress);
+    if (length < sizeof(report)) report[length++] = '\n';
+    (void)write(fd, report, length);
+    close(fd);
+  }
+  _exit(sig);
+}
+
+static void log_crash_exit(const char *reason, void *caller_ra) {
+  FILE *f = fopen(DATA_ROOT "/crash_exit.txt", "w");
+  if (f) {
+    u64 used = 0, total = 0;
+    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    fprintf(f, "%s frame=%d in_render=%d used=%lluM total=%lluM\n", reason,
+            g_render_frame, g_render_in_progress,
+            (unsigned long long)(used / (1024 * 1024)),
+            (unsigned long long)(total / (1024 * 1024)));
+    fprintf(f, "il2cpp_base=0x%lx il2cpp_size=0x%lx\n",
+            (unsigned long)g_il2cpp_base,
+            (unsigned long)g_il2cpp_size);
+
+    extern void _start(void);
+    extern char __bss_end__[];
+    const uintptr_t host_base = (uintptr_t)&_start;
+    const uintptr_t host_end = (uintptr_t)__bss_end__;
+
+    /* Walk the stack via frame pointers starting from abort's caller. */
+    uintptr_t addrs[16];
+    int naddrs = 0;
+    if (caller_ra) addrs[naddrs++] = (uintptr_t)caller_ra;
+
+    /* Get abort()'s frame pointer and walk up. */
+    void *fp = __builtin_frame_address(0);
+    for (int depth = 0; depth < 14 && fp; depth++) {
+      uintptr_t fp_addr = (uintptr_t)fp;
+      MemoryInfo mi;
+      u32 pi;
+      if (R_FAILED(svcQueryMemory(&mi, &pi, fp_addr)) ||
+          !(mi.perm & Perm_R) || mi.type == MemType_Unmapped ||
+          fp_addr < mi.addr ||
+          sizeof(uint64_t) * 2 > (size_t)(mi.addr + mi.size - fp_addr))
+        break;
+      uint64_t frame[2];
+      memcpy(frame, fp, sizeof(frame));
+      if (frame[1]) addrs[naddrs++] = (uintptr_t)frame[1];
+      if (!frame[0] || frame[0] <= (uint64_t)fp_addr) break;
+      fp = (void *)(uintptr_t)frame[0];
+    }
+
+    for (int i = 0; i < naddrs; i++) {
+      uintptr_t a = addrs[i];
+      MemoryInfo mi;
+      u32 pi;
+      Result qr = svcQueryMemory(&mi, &pi, a);
+      if (g_il2cpp_base && a >= g_il2cpp_base &&
+          a - g_il2cpp_base < g_il2cpp_size) {
+        fprintf(f, "  bt%d=0x%lx guest+0x%lx", i,
+                (unsigned long)a, (unsigned long)(a - g_il2cpp_base));
+      } else if (a >= host_base && a < host_end) {
+        fprintf(f, "  bt%d=0x%lx host+0x%lx", i,
+                (unsigned long)a, (unsigned long)(a - host_base));
+      } else {
+        fprintf(f, "  bt%d=0x%lx absolute", i, (unsigned long)a);
+      }
+      if (R_SUCCEEDED(qr)) {
+        fprintf(f, " mem[addr=0x%lx size=0x%lx type=%d perm=0x%x]",
+                (unsigned long)mi.addr, (unsigned long)mi.size,
+                (int)mi.type, (unsigned)mi.perm);
+      }
+      fprintf(f, "\n");
+    }
+    fflush(f);
+    fclose(f);
+  }
+}
+
+void exit(int status) {
+  log_crash_exit(g_abort_source ? g_abort_source : "exit",
+                 __builtin_return_address(0));
+  _exit(status);
+}
+
+void abort(void) {
+  const char *reason = g_abort_source ? g_abort_source : "abort";
+  void *caller = __builtin_return_address(0);
+  register uintptr_t sp_val asm("sp");
+  FILE *f = fopen(DATA_ROOT "/crash_exit.txt", "w");
+  if (f) {
+    u64 used = 0, total = 0;
+    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    fprintf(f, "%s frame=%d in_render=%d used=%lluM total=%lluM\n", reason,
+            g_render_frame, g_render_in_progress,
+            (unsigned long long)(used / (1024 * 1024)),
+            (unsigned long long)(total / (1024 * 1024)));
+    fprintf(f, "il2cpp_base=0x%lx il2cpp_size=0x%lx\n",
+            (unsigned long)g_il2cpp_base,
+            (unsigned long)g_il2cpp_size);
+
+    extern void _start(void);
+    extern char __bss_end__[];
+    const uintptr_t host_base = (uintptr_t)&_start;
+    const uintptr_t host_end = (uintptr_t)__bss_end__;
+
+    fprintf(f, "caller=0x%lx\n", (unsigned long)(uintptr_t)caller);
+    if (caller) {
+      uintptr_t a = (uintptr_t)caller;
+      if (g_il2cpp_base && a >= g_il2cpp_base &&
+          a - g_il2cpp_base < g_il2cpp_size)
+        fprintf(f, "  caller=guest+0x%lx\n", (unsigned long)(a - g_il2cpp_base));
+      else if (a >= host_base && a < host_end)
+        fprintf(f, "  caller=host+0x%lx\n", (unsigned long)(a - host_base));
+      else
+        fprintf(f, "  caller=absolute\n");
+    }
+
+    fprintf(f, "stack scan sp=0x%lx:\n", (unsigned long)sp_val);
+    for (int i = 0; i < 1024; i++) {
+      uintptr_t addr = sp_val + (uintptr_t)i * 8;
+      MemoryInfo mi;
+      u32 pi;
+      if (R_FAILED(svcQueryMemory(&mi, &pi, addr)) ||
+          !(mi.perm & Perm_R) || mi.type == MemType_Unmapped ||
+          addr < mi.addr ||
+          sizeof(uint64_t) > (size_t)(mi.addr + mi.size - addr))
+        continue;
+      uint64_t val = *(uint64_t *)addr;
+      if (!val) continue;
+      if ((val >= host_base && val < host_end) ||
+          (g_il2cpp_base && val >= g_il2cpp_base &&
+           val < g_il2cpp_base + g_il2cpp_size)) {
+        fprintf(f, "  [sp+0x%x]=0x%llx", i * 8,
+                (unsigned long long)val);
+        if (val >= host_base && val < host_end)
+          fprintf(f, " host+0x%llx", (unsigned long long)(val - host_base));
+        else
+          fprintf(f, " guest+0x%llx",
+                  (unsigned long long)(val - g_il2cpp_base));
+        fprintf(f, "\n");
+      }
+    }
+    panic_capture_report(f);
+    {
+      NxSparseArenaDiagnostics diag = {0};
+      nx_sparse_arena_get_diagnostics(&diag);
+      const unsigned long long MiB = 1024ull * 1024ull;
+      fprintf(f,
+              "pool backend=%u committed=%lluMiB peak_committed=%lluMiB "
+              "pool_free=%lluMiB largest_free=%lluMiB\n",
+              diag.backing_backend,
+              diag.committed_bytes / MiB,
+              diag.peak_committed_bytes / MiB,
+              diag.pool_free_bytes / MiB,
+              diag.pool_largest_free_bytes / MiB);
+      fprintf(f,
+              "donor cap=%lluMiB active=%lluMiB used=%lluMiB/peak=%lluMiB "
+              "grow=%llu shrink=%llu last_resize=0x%x\n",
+              diag.donor_capacity_bytes / MiB,
+              diag.donor_active_bytes / MiB,
+              diag.donor_used_bytes / MiB,
+              diag.donor_peak_used_bytes / MiB,
+              (unsigned long long)diag.donor_grow_calls,
+              (unsigned long long)diag.donor_shrink_calls,
+              diag.donor_last_resize_result);
+      fprintf(f,
+              "alloc_failures guest=%llu host=%llu thread=%llu "
+              "dynamic_mapped=%lluMiB/peak=%lluMiB last_map=0x%x\n",
+              (unsigned long long)diag.guest_allocation_failures,
+              (unsigned long long)diag.host_allocation_failures,
+              (unsigned long long)diag.thread_allocation_failures,
+              diag.dynamic_mapped_bytes / MiB,
+              diag.peak_dynamic_mapped_bytes / MiB,
+              diag.last_map_result);
+      fprintf(f, "backing_unmap ok=%llu fail=%llu\n",
+              (unsigned long long)diag.backing_unmap_ok,
+              (unsigned long long)diag.backing_unmap_fail);
+    }
+    sbrk_extension_report(f);
+    memory_broker_histogram_report(f);
+    fflush(f);
+    fclose(f);
+  }
+  _exit(1);
+}
+
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
+
+  signal(SIGSEGV, crash_signal_handler);
+  signal(SIGABRT, crash_signal_handler);
+  signal(SIGILL, crash_signal_handler);
+  signal(SIGBUS, crash_signal_handler);
+  signal(SIGFPE, crash_signal_handler);
+
+  /* Host Rust (NVK/NAK) panics print their message with raw write(2).  Bind
+   * fd 2 to a durable file early so the payload survives instead of hitting
+   * the uninitialized software-console devoptab.  Guest writes to fd 1/2 keep
+   * flowing through the nx_write logging endpoints, unaffected. */
+  {
+    static char rust_backtrace_env[] = "RUST_BACKTRACE=1";
+    int err_fd = open(DATA_ROOT "/stderr.txt",
+                      O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (err_fd >= 0) {
+      if (err_fd != STDERR_FILENO) {
+        dup2(err_fd, STDERR_FILENO);
+        close(err_fd);
+      }
+    }
+    putenv(rust_backtrace_env);
+  }
 
   startup_status_begin("Validating the Android client");
   if (chdir(DATA_ROOT) != 0)
@@ -1856,6 +2158,11 @@ int main(int argc, char **argv) {
                 DATA_ROOT);
   make_runtime_dirs();
   unlink(DATA_ROOT "/fatal.txt");
+  unlink(DATA_ROOT "/run_log.txt");
+  unlink(DATA_ROOT "/crash_frame.txt");
+  unlink(DATA_ROOT "/crash_signal.txt");
+  unlink(DATA_ROOT "/crash_exit.txt");
+  unlink(DATA_ROOT "/arena_debug.txt");
 
   /* Validate the kernel-heap boundary before APK/asset-pack work performs any
    * ordinary allocations. */
@@ -2068,7 +2375,9 @@ int main(int argc, char **argv) {
   int unity_active = 1;
   int display_recreate_pending = 0;
   int first_render_done = 0;
-  while (appletMainLoop() && !jni_quit_requested) {
+  int frame_count = 0;
+  int applet_running = 1;
+  while ((applet_running = appletMainLoop()) && !jni_quit_requested) {
     const int now_focused = appletGetFocusState() == AppletFocusState_InFocus;
     if (android_native_update_mode()) {
       display_recreate_pending = 1;
@@ -2139,9 +2448,32 @@ int main(int argc, char **argv) {
       (uint8_t (*)(void *, void *, void *, int))unity_inject,
       fake_env, fake_unityplayer_thiz);
     jni_boundary_end();
+    if (frame_count % 120 == 0) {
+      NxSparseArenaDiagnostics diag = {0};
+      nx_sparse_arena_get_diagnostics(&diag);
+      FILE *lf = fopen(DATA_ROOT "/run_log.txt", "ab");
+      if (lf) {
+        const unsigned long long MiB = 1024ull * 1024ull;
+        fprintf(lf,
+                "[I] main: frame %d used=%lluM total=%lluM "
+                "donor=%lluM/%lluM mapped=%lluM unmap=%llu/%llu\n",
+                frame_count,
+                diag.system_used_memory_bytes / MiB,
+                diag.system_total_memory_bytes / MiB,
+                diag.donor_used_bytes / MiB,
+                diag.donor_active_bytes / MiB,
+                diag.dynamic_mapped_bytes / MiB,
+                (unsigned long long)diag.backing_unmap_ok,
+                (unsigned long long)diag.backing_unmap_fail);
+        fclose(lf);
+      }
+    }
+    g_render_frame = frame_count;
+    g_render_in_progress = 1;
     jni_boundary_begin("nativeRender");
     const int render_continues = unity_render(fake_env, fake_unityplayer_thiz);
     jni_boundary_end();
+    g_render_in_progress = 0;
     /* Exact-image call chain: nativeRender RVA 0x49c3cd4 reaches
      * 0x49bb288 -> 0x531ff84 -> 0x44974e8 -> 0x44ac054.  That final function
      * performs the 0x100800000-byte mmap through 0x44b5748 and publishes the
@@ -2151,6 +2483,7 @@ int main(int argc, char **argv) {
       validate_unity_slab_client_state(unity_slab_reservation,
                                        unity_slab_reservation_size);
     if (!render_continues) break;
+    ++frame_count;
     if (!first_render_done) {
       first_render_done = 1;
       repair_combo_managed_class_name();
@@ -2192,6 +2525,15 @@ int main(int argc, char **argv) {
       combo_auth_tick();
       write_thread_pointer(guest_thread_pointer);
     }
+  }
+
+  g_render_frame = frame_count;
+  FILE *lf = fopen(DATA_ROOT "/run_log.txt", "ab");
+  if (lf) {
+    fprintf(lf, "[I] main: render loop exited after %d frames "
+            "(jni_quit_requested=%d appletMainLoop=%d)\n",
+            frame_count, jni_quit_requested, applet_running);
+    fclose(lf);
   }
 
   opensles_set_focus(0);

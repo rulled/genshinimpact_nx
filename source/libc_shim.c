@@ -2124,6 +2124,12 @@ static uint64_t oc_peak_dynamic_mapped_segments;
 static uint64_t oc_map_call_count;
 static uint64_t oc_map_retry_count;
 static uint32_t oc_last_map_result;
+/* Code-alias unmap accounting.  Making an AliasCode mapping writable changes
+ * its state to AliasCodeData; that transition cannot be reversed with
+ * svcSetProcessMemoryPermission.  svcUnmapProcessCodeMemory accepts the writable
+ * state directly. */
+static uint64_t oc_backing_unmap_ok;
+static uint64_t oc_backing_unmap_fail;
 static uint64_t oc_spill_pages;
 static uint64_t oc_peak_spill_pages;
 static uint64_t oc_host_spill_pages;
@@ -2136,6 +2142,8 @@ static uint64_t oc_thread_allocation_failures;
 static uint64_t oc_allocation_slots_in_use;
 static uint64_t oc_peak_allocation_slots_in_use;
 static uint64_t oc_allocation_slot_exhaustions;
+
+const char *g_oc_arena_failure_stage = "not attempted";
 
 #define OC_DYNAMIC_MAX_PAGES \
   (OC_DYNAMIC_ARENA_BYTES / MMAP_PAGE)
@@ -2155,10 +2163,10 @@ static uint64_t oc_allocation_slot_exhaustions;
 #define OC_DYNAMIC_MAX_EXTENT_CAPACITY \
   ((OC_DYNAMIC_MAX_PAGES + 1u) / 2u)
 #define OC_ALIAS_LAYOUT_ALIGNMENT MMAP_ARENA_ALIGN
-/* A deprecated 36-bit process exposes at most 64 GiB total.  The zero-system-
- * resource backend deliberately requires the corrected 39-bit launcher: its
- * shader workload needs more than the 1,792 MiB legacy layout. */
-#define OC_39BIT_ASLR_THRESHOLD_BYTES ((u64)64 * 1024 * 1024 * 1024)
+/* A 36-bit process exposes ~63.875 GiB of ASLR, which is sufficient for the
+ * ~10 GiB sparse/slab layout when using the heap-donor backend.  Reject only
+ * address spaces too small for the layout itself. */
+#define OC_39BIT_ASLR_THRESHOLD_BYTES ((u64)2 * 1024 * 1024 * 1024)
 
 typedef enum {
   OC_POOL_OWNER_NONE = 0,
@@ -2331,28 +2339,47 @@ static size_t oc_select_dynamic_arena_bytes(void) {
     (u64)OC_DYNAMIC_ARENA_BYTES + UNITY_SLAB_RESERVATION_BYTES;
   const u64 large_search = large_layout + OC_ALIAS_LAYOUT_ALIGNMENT;
   if (g_memory_backing_backend != NX_MEMORY_BACKEND_HEAP_ALIAS &&
-      g_memory_backing_backend != NX_MEMORY_BACKEND_PHYSICAL)
+      g_memory_backing_backend != NX_MEMORY_BACKEND_PHYSICAL) {
+    g_oc_arena_failure_stage = "select:backend-none";
     return 0;
+  }
   u64 aslr_size = 0;
   if (R_FAILED(svcGetInfo(&aslr_size, InfoType_AslrRegionSize,
-                          CUR_PROCESS_HANDLE, 0)) ||
-      aslr_size <= OC_39BIT_ASLR_THRESHOLD_BYTES ||
-      aslr_size < large_search)
+                          CUR_PROCESS_HANDLE, 0))) {
+    g_oc_arena_failure_stage = "select:aslr-query-failed";
     return 0;
+  }
+  if (aslr_size <= OC_39BIT_ASLR_THRESHOLD_BYTES) {
+    g_oc_arena_failure_stage = "select:aslr-too-small";
+    return 0;
+  }
+  if (aslr_size < large_search) {
+    g_oc_arena_failure_stage = "select:aslr-too-small";
+    return 0;
+  }
   if (g_memory_backing_backend == NX_MEMORY_BACKEND_HEAP_ALIAS)
     return OC_DYNAMIC_ARENA_BYTES;
 
   u64 alias_size = 0;
   u64 alias_extra = 0;
   if (R_FAILED(svcGetInfo(&alias_size, InfoType_AliasRegionSize,
-                          CUR_PROCESS_HANDLE, 0)))
+                          CUR_PROCESS_HANDLE, 0))) {
+    g_oc_arena_failure_stage = "select:alias-query-failed";
     return 0;
+  }
   if (R_FAILED(svcGetInfo(&alias_extra, InfoType_AliasRegionExtraSize,
                           CUR_PROCESS_HANDLE, 0)))
     alias_extra = 0;
-  if (alias_extra >= alias_size) return 0;
+  if (alias_extra >= alias_size) {
+    g_oc_arena_failure_stage = "select:alias-extra-overflow";
+    return 0;
+  }
   const u64 usable = alias_size - alias_extra;
-  return usable >= large_search ? OC_DYNAMIC_ARENA_BYTES : 0;
+  if (usable < large_search) {
+    g_oc_arena_failure_stage = "select:alias-too-small";
+    return 0;
+  }
+  return OC_DYNAMIC_ARENA_BYTES;
 }
 
 size_t nx_dynamic_arena_target_bytes(void) {
@@ -2739,6 +2766,28 @@ static Result oc_backing_map_locked(void *destination, size_t size,
   return result;
 }
 
+/* One-shot diagnostic for the first code-alias unmap failure.  Write the
+ * destination's queried memory state straight to fd 2 (stderr.txt) so the data
+ * survives without allocating or re-entering the broker lock. */
+static void oc_backing_unmap_diag_once(void *destination, size_t size,
+                                       void *source_address,
+                                       Result unmap_result) {
+  static _Atomic int once = 0;
+  if (__atomic_exchange_n(&once, 1, __ATOMIC_ACQ_REL)) return;
+  MemoryInfo mi;
+  u32 pi = 0;
+  Result q = svcQueryMemory(&mi, &pi, (u64)destination);
+  char buf[256];
+  int n = snprintf(buf, sizeof buf,
+    "backing_unmap_fail dst=%p src=%p size=0x%zx unmap=0x%08x "
+    "query=0x%08x dst[addr=0x%lx size=0x%lx type=%u perm=0x%x attr=0x%x ip=0x%x]\n",
+    destination, source_address, size,
+    (unsigned)unmap_result, (unsigned)q,
+    (unsigned long)mi.addr, (unsigned long)mi.size,
+    (unsigned)mi.type, (unsigned)mi.perm, (unsigned)mi.attr, (unsigned)pi);
+  if (n > 0) (void)write(2, buf, (size_t)(n < (int)sizeof buf ? n : (int)sizeof buf - 1));
+}
+
 static Result oc_backing_unmap_locked(void *destination, size_t size,
                                       uint32_t source) {
   if (g_memory_backing_backend == NX_MEMORY_BACKEND_PHYSICAL)
@@ -2752,11 +2801,22 @@ static Result oc_backing_unmap_locked(void *destination, size_t size,
   const Handle process = envGetOwnProcessHandle();
   if (process == INVALID_HANDLE)
     return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+  /* svcSetProcessMemoryPermission(Perm_Rw) changes AliasCode into the writable
+   * AliasCodeData state.  That state no longer carries FlagCode, so trying to
+   * reset its permission (including Perm_None) returns InvalidMemoryState.
+   * UnmapCodeMemory accepts AliasCodeData directly and restores the locked
+   * source heap pages to ordinary RW memory; this is also libnx's JIT teardown
+   * sequence. */
   const Result result = svcUnmapProcessCodeMemory(
     process, (u64)destination, (u64)source_address, size);
-  if (R_SUCCEEDED(result))
-    oc_donor_release_locked(source,
-      size / OC_HEAP_DONOR_UNIT_BYTES);
+  if (R_FAILED(result)) {
+    __atomic_add_fetch(&oc_backing_unmap_fail, 1, __ATOMIC_RELAXED);
+    oc_backing_unmap_diag_once(destination, size, source_address, result);
+    return result;
+  }
+  __atomic_add_fetch(&oc_backing_unmap_ok, 1, __ATOMIC_RELAXED);
+  oc_donor_release_locked(source,
+    size / OC_HEAP_DONOR_UNIT_BYTES);
   return result;
 }
 
@@ -2914,9 +2974,13 @@ static void oc_dynamic_release_segments_locked(size_t first, size_t pages) {
       oc_dynamic_base + segment * OC_DYNAMIC_SEGMENT_BYTES,
       OC_DYNAMIC_SEGMENT_BYTES,
       oc_dynamic_segment_sources[segment]);
-    if (R_FAILED(result))
-      fatal_error("Dynamic memory decommit failed: 0x%08x.",
-                  (unsigned)result);
+    if (R_FAILED(result)) {
+      /* If Horizon cannot unmap this exact source/destination range, preserve
+       * the live mapping and donor ownership.  The pages are already back in
+       * the free extent map, so future allocations can reuse the backing
+       * without creating an overlapping alias. */
+      continue;
+    }
     oc_dynamic_segment_mapped[segment] = 0;
     oc_dynamic_segment_sources[segment] = 0;
     const uint64_t mapped = __atomic_load_n(
@@ -3270,7 +3334,10 @@ int nx_alias_memory_arenas_prepare(void) {
      unity_slab_prepared_base || unity_slab_state != UNITY_SLAB_EMPTY);
   mmap_broker_unlock();
   if (already_ready) return 1;
-  if (partial_layout) return 0;
+  if (partial_layout) {
+    g_oc_arena_failure_stage = "prepare:partial-layout";
+    return 0;
+  }
 
   int published = 0;
   int ready = 0;
@@ -3278,8 +3345,13 @@ int nx_alias_memory_arenas_prepare(void) {
   const size_t arena_bytes = oc_select_dynamic_arena_bytes();
   if (!arena_bytes || arena_bytes % MMAP_PAGE ||
       arena_bytes > OC_DYNAMIC_ARENA_BYTES ||
-      arena_bytes > SIZE_MAX - UNITY_SLAB_RESERVATION_BYTES)
+      arena_bytes > SIZE_MAX - UNITY_SLAB_RESERVATION_BYTES) {
+    if (!g_oc_arena_failure_stage[0] ||
+        !strncmp(g_oc_arena_failure_stage, "not attempted", 13) ||
+        !strncmp(g_oc_arena_failure_stage, "prepare:", 8))
+      g_oc_arena_failure_stage = "prepare:arena-bytes-invalid";
     return 0;
+  }
   const size_t arena_pages = arena_bytes / MMAP_PAGE;
   const size_t arena_segments = arena_bytes / OC_DYNAMIC_SEGMENT_BYTES;
   const size_t sparse_granules =
@@ -3292,8 +3364,10 @@ int nx_alias_memory_arenas_prepare(void) {
       !extent_capacity ||
       extent_capacity > OC_DYNAMIC_MAX_EXTENT_CAPACITY ||
       (g_memory_backing_backend == NX_MEMORY_BACKEND_HEAP_ALIAS &&
-       arena_bytes <= g_heap_donor_capacity))
+       arena_bytes <= g_heap_donor_capacity)) {
+    g_oc_arena_failure_stage = "prepare:bounds-check";
     return 0;
+  }
 
   /* These records bootstrap the fallback allocator itself, so they must come
    * only from newlib's fixed heap and must never recurse into the dynamic arena
@@ -3332,13 +3406,19 @@ int nx_alias_memory_arenas_prepare(void) {
       !sparse_sources || !segment_mapped || !segment_live ||
       !segment_sources ||
       (g_memory_backing_backend == NX_MEMORY_BACKEND_HEAP_ALIAS &&
-       (!donor_units || !donor_allocations)))
+       (!donor_units || !donor_allocations))) {
+    g_oc_arena_failure_stage = "prepare:metadata-alloc";
     goto fail_metadata;
+  }
 
   OcVirtualLayout layout;
-  if (!oc_reserve_virtual_layout(&layout, layout_bytes)) goto fail_metadata;
+  if (!oc_reserve_virtual_layout(&layout, layout_bytes)) {
+    g_oc_arena_failure_stage = "prepare:reserve-layout";
+    goto fail_metadata;
+  }
   if (!oc_address_range_state(layout.base, layout_bytes,
                               0, MemType_Unmapped)) {
+    g_oc_arena_failure_stage = "prepare:range-not-unmapped";
     virtmemLock();
     virtmemRemoveReservation(layout.reservation);
     virtmemUnlock();
@@ -3355,6 +3435,7 @@ int nx_alias_memory_arenas_prepare(void) {
     slab_base + UNITY_SLAB_RESERVATION_BYTES ==
       sparse_base + layout_bytes;
   if (!partition_geometry_valid) {
+    g_oc_arena_failure_stage = "prepare:partition-geometry";
     virtmemLock();
     virtmemRemoveReservation(layout.reservation);
     virtmemUnlock();
@@ -3421,6 +3502,7 @@ int nx_alias_memory_arenas_prepare(void) {
   mmap_broker_unlock();
   if (published) return 1;
 
+  g_oc_arena_failure_stage = "prepare:lost-race";
   virtmemLock();
   virtmemRemoveReservation(layout.reservation);
   virtmemUnlock();
@@ -3558,6 +3640,10 @@ void nx_sparse_arena_get_diagnostics(NxSparseArenaDiagnostics *out) {
     __atomic_load_n(&oc_map_retry_count, __ATOMIC_RELAXED);
   out->last_map_result =
     __atomic_load_n(&oc_last_map_result, __ATOMIC_RELAXED);
+  out->backing_unmap_ok =
+    __atomic_load_n(&oc_backing_unmap_ok, __ATOMIC_RELAXED);
+  out->backing_unmap_fail =
+    __atomic_load_n(&oc_backing_unmap_fail, __ATOMIC_RELAXED);
   out->ownership_record_capacity =
     __atomic_load_n(&oc_dynamic_pages, __ATOMIC_RELAXED) +
       oc_donor_unit_capacity;
@@ -3799,9 +3885,15 @@ static void oc_decommit_locked(void *addr, size_t len) {
         oc_base + granule_first * MMAP_PAGE,
         OC_SPARSE_COMMIT_GRANULE_BYTES,
         oc_sparse_granule_sources[granule]);
-      if (R_FAILED(result))
-        fatal_error("Could not release sparse backing memory: 0x%08x.",
-                    (unsigned)result);
+      if (R_FAILED(result)) {
+        /* A code alias can be unmapped only with the exact source/destination
+         * range accepted by Horizon.  Keep rejected backing recorded, but
+         * preserve anonymous MADV_DONTNEED/munmap semantics before recycling
+         * the virtual extent. */
+        memset(oc_base + granule_first * MMAP_PAGE, 0,
+               OC_SPARSE_COMMIT_GRANULE_BYTES);
+        continue;
+      }
       memset(oc_committed + granule_first, 0,
              OC_SPARSE_GRANULE_PAGES);
       oc_sparse_granule_sources[granule] = 0;
@@ -4569,9 +4661,11 @@ int munmap_fake(void *addr, size_t length) {
       for (size_t chunk = 0; chunk < UNITY_SLAB_CHUNK_COUNT; ++chunk) {
         const Result result = mmap_decommit_unity_slab_chunk_locked(chunk);
         if (R_FAILED(result)) {
-          mmap_broker_unlock();
-          fatal_error("Unity slab physical decommit failed at chunk %u (0x%08x).",
-                      (unsigned)chunk, (unsigned)result);
+          /* Code-alias decommit may be rejected by the kernel for the heap-donor
+           * alias path (see oc_backing_unmap_locked).  Leave the chunk marked
+           * committed and continue: its backing stays valid, and a future
+           * remap of the same reservation will find it already committed. */
+          continue;
         }
       }
       unity_slab_diag_increment(&unity_slab_diagnostics.exact_unmaps);

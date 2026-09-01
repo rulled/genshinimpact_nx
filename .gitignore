@@ -1,5 +1,7 @@
 # devkitPro build output
 build_nx/
+build_nx_external/
+symbols.txt
 *.elf
 *.nro
 *.nacp

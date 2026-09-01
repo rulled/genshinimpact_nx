@@ -240,6 +240,11 @@ typedef struct {
   uint64_t donor_shrink_calls;
   uint32_t donor_last_resize_result;
   uint32_t backing_backend;
+  /* Code-alias decommit accounting for the heap-donor backing path.  ok means
+   * svcUnmapProcessCodeMemory recycled the source into the donor; fail means
+   * the writable alias stayed mapped for safe reuse. */
+  uint64_t backing_unmap_ok;
+  uint64_t backing_unmap_fail;
 } NxSparseArenaDiagnostics;
 
 typedef enum {

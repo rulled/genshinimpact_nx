@@ -203,8 +203,15 @@ static size_t nx_guest_malloc_usable_size(void *pointer) {
   if (nx_sparse_pool_contains_address(pointer)) return 0;
   return nx_primary_malloc_usable_size(pointer);
 }
-void __stack_chk_fail_fake(void) { abort(); }
-static void __cxa_pure_virtual_fake(void) { abort(); }
+const char *g_abort_source = NULL;
+void __stack_chk_fail_fake(void) {
+  g_abort_source = "__stack_chk_fail";
+  abort();
+}
+static void __cxa_pure_virtual_fake(void) {
+  g_abort_source = "__cxa_pure_virtual";
+  abort();
+}
 static int nx_daylight_data;
 static long nx_timezone_data;
 static char nx_timezone_name[] = "UTC";
