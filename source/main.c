@@ -1424,8 +1424,13 @@ static void patch_unity_slab_activation(void) {
     fatal_error("Could not install the Unity slab on-demand commit bridge.");
 }
 
-typedef void *(*GenshinIl2CppStringNewLenFn)(const char *, int32_t);
+/* 1224 inlined il2cpp_string_new_len, so the NRO reimplements it via the
+ * game's own GC helpers (see genshin_il2cpp_string_new_len). */
+typedef void *(*GenshinIl2CppTypeResolverFn)(void *type_ptr);
+typedef void *(*GenshinIl2CppSizedAllocFn)(void *klass, uint32_t size,
+                                           void *alloc_vtable);
 static int readable_object_span(const void *object, size_t bytes);
+static void *genshin_il2cpp_string_new_len(const char *ascii, int32_t length);
 
 /* Runtime continuation consumed by the caller-scoped naked dispatcher below.
  * It is published only after the exact source image and the replaced
@@ -1494,10 +1499,8 @@ void *genshin_mmoron_directory_sequence_bridge(void *parameters) {
 
   void *selected = path;
   if (!readable || strcmp(normalized, original)) {
-    GenshinIl2CppStringNewLenFn string_new_len =
-      (GenshinIl2CppStringNewLenFn)(module_base +
-                                    GENSHIN_IL2CPP_STRING_NEW_LEN_RVA);
-    selected = string_new_len(normalized, (int32_t)strlen(normalized));
+    selected = genshin_il2cpp_string_new_len(normalized,
+                                             (int32_t)strlen(normalized));
     if (!selected) selected = path;
   }
 
@@ -1558,6 +1561,62 @@ static int readable_object_span(const void *object, size_t bytes) {
       address - info.addr > info.size - bytes)
     return 0;
   return 1;
+}
+
+/* Reimplemented il2cpp_string_new_len for the 1224 client.  The original
+ * helper was inlined by the compiler (no callable (char*,len)->Il2CppString*
+ * exists in the RX segment), so the legacy GENSHIN_IL2CPP_STRING_NEW_LEN_RVA
+ * cannot be used.  This replicates the game's own Il2CppString construction at
+ * RVA 0x79b9814 via its native GC helpers:
+ *   1. load the Il2CppString alloc-vtable from the GC slab (page + 0x700);
+ *   2. resolve the type holder (0x782A890) and read [holder] for the class;
+ *   3. sized-allocate (0x4128E94) with size = len*2 + 0x14 + 0x2;
+ *   4. store the int32 length @ +0x10 and zero-extend ASCII to UTF-16 @ +0x14.
+ * Returns a GC-managed Il2CppString* or NULL when the GC slab/type is not yet
+ * initialized (callers treat NULL as a repair failure). */
+static void *genshin_il2cpp_string_new_len(const char *ascii, int32_t length) {
+  if (!ascii || length < 0 || length > 0x7fff)
+    return NULL;
+  const uintptr_t base = (uintptr_t)game_mod.load_virtbase;
+  void **const gc_vtable_slot = (void **)(base +
+    GENSHIN_IL2CPP_GC_PAGE_RVA + GENSHIN_IL2CPP_GC_ALLOC_VTABLE_OFFSET);
+  void *const *const type_holder =
+    (void *const *)(base + GENSHIN_IL2CPP_STRING_TYPE_PTR_RVA);
+  if (!module_contains(gc_vtable_slot, sizeof(*gc_vtable_slot)) ||
+      !module_contains(type_holder, sizeof(*type_holder)) ||
+      !module_contains((const void *)(base + GENSHIN_IL2CPP_TYPE_RESOLVER_RVA), 4) ||
+      !module_contains((const void *)(base + GENSHIN_IL2CPP_SIZED_ALLOC_RVA), 4))
+    return NULL;
+  void *const alloc_vtable = __atomic_load_n(gc_vtable_slot, __ATOMIC_ACQUIRE);
+  if (!alloc_vtable)
+    return NULL;
+  GenshinIl2CppTypeResolverFn resolve_type =
+    (GenshinIl2CppTypeResolverFn)(base + GENSHIN_IL2CPP_TYPE_RESOLVER_RVA);
+  void *holder = resolve_type((void *)type_holder);
+  if (!holder)
+    return NULL;
+  void *klass = __atomic_load_n((void *volatile *)holder, __ATOMIC_ACQUIRE);
+  if (!klass)
+    return NULL;
+  const uint32_t size = (uint32_t)length * 2u +
+                        (uint32_t)GENSHIN_IL2CPP_STRING_HEADER_BYTES +
+                        (uint32_t)GENSHIN_IL2CPP_STRING_TERM_BYTES;
+  GenshinIl2CppSizedAllocFn sized_alloc =
+    (GenshinIl2CppSizedAllocFn)(base + GENSHIN_IL2CPP_SIZED_ALLOC_RVA);
+  void *object = sized_alloc(klass, size, alloc_vtable);
+  if (!object)
+    return NULL;
+  /* int32 length @ +0x10 */
+  memcpy((uint8_t *)object + 0x10, &length, sizeof(length));
+  /* ASCII -> zero-extended UTF-16 @ +0x14, NUL-terminated */
+  uint8_t *const chars = (uint8_t *)object + 0x14;
+  for (int32_t i = 0; i < length; ++i) {
+    chars[2 * i] = (uint8_t)ascii[i];
+    chars[2 * i + 1] = 0;
+  }
+  chars[2 * length] = 0;
+  chars[2 * length + 1] = 0;
+  return object;
 }
 
 static int writable_object_span(const void *object, size_t bytes) {
@@ -1732,14 +1791,22 @@ static void repair_combo_managed_class_name(void) {
     (void **)(module_base + GENSHIN_JAVA_FOR_NAME_SLOT_RVA);
   void *const *const empty_args_slot =
     (void *const *)(module_base + GENSHIN_EMPTY_OBJECT_ARGS_SLOT_RVA);
-  const uintptr_t string_new_len_address =
-    module_base + GENSHIN_IL2CPP_STRING_NEW_LEN_RVA;
-  /* The forName slot, the empty-args slot, and the string_new_len helper are
-   * all statically verified; a miss here is a real version mismatch. */
+  /* 1224 inlined il2cpp_string_new_len, so the legacy
+   * GENSHIN_IL2CPP_STRING_NEW_LEN_RVA is not a callable helper.  The repair
+   * fallback below uses genshin_il2cpp_string_new_len (which drives the game's
+   * own GC helpers); verify those RVAs land in the exact client image. */
+  const uintptr_t type_resolver_address =
+    module_base + GENSHIN_IL2CPP_TYPE_RESOLVER_RVA;
+  const uintptr_t sized_alloc_address =
+    module_base + GENSHIN_IL2CPP_SIZED_ALLOC_RVA;
+  /* The forName slot, the empty-args slot, and the GC helpers are all
+   * statically verified; a miss here is a real version mismatch. */
   if (!module_contains(for_name_slot, sizeof(*for_name_slot)) ||
       !module_contains(empty_args_slot, sizeof(*empty_args_slot)) ||
-      !module_contains((const void *)string_new_len_address, 4) ||
-      (string_new_len_address & 3u))
+      !module_contains((const void *)type_resolver_address, 4) ||
+      (type_resolver_address & 3u) ||
+      !module_contains((const void *)sized_alloc_address, 4) ||
+      (sized_alloc_address & 3u))
     fatal_error("MiHoYoSDK managed bootstrap RVAs are outside the exact client image.");
   if (combo_slot_known &&
       !module_contains(class_name_slot, sizeof(*class_name_slot)))
@@ -1753,10 +1820,9 @@ static void repair_combo_managed_class_name(void) {
     current = __atomic_load_n(class_name_slot, __ATOMIC_ACQUIRE);
     if (managed_string_equals(current, class_name, sizeof(class_name) - 1u)) {
     } else {
-      GenshinIl2CppStringNewLenFn string_new_len =
-        (GenshinIl2CppStringNewLenFn)string_new_len_address;
       void *const created =
-        string_new_len(class_name, (int32_t)(sizeof(class_name) - 1u));
+        genshin_il2cpp_string_new_len(class_name,
+                                      (int32_t)(sizeof(class_name) - 1u));
       if (!created ||
           !managed_string_equals(created, class_name, sizeof(class_name) - 1u))
         fatal_error("IL2CPP returned an invalid MiHoYoSDK class-name string.");
@@ -1773,10 +1839,9 @@ static void repair_combo_managed_class_name(void) {
   current = __atomic_load_n(for_name_slot, __ATOMIC_ACQUIRE);
   if (managed_string_equals(current, for_name, sizeof(for_name) - 1u)) {
   } else {
-    GenshinIl2CppStringNewLenFn string_new_len =
-      (GenshinIl2CppStringNewLenFn)string_new_len_address;
     void *const created =
-      string_new_len(for_name, (int32_t)(sizeof(for_name) - 1u));
+      genshin_il2cpp_string_new_len(for_name,
+                                    (int32_t)(sizeof(for_name) - 1u));
     if (!created ||
         !managed_string_equals(created, for_name, sizeof(for_name) - 1u))
       fatal_error("IL2CPP returned an invalid JavaLangClass forName string.");

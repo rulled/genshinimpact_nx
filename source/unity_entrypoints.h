@@ -49,7 +49,34 @@
  * matching. */
 #define GENSHIN_EMPTY_OBJECT_ARGS_SLOT_RVA UINT64_C(0x14D08480)
 #define GENSHIN_JAVA_FOR_NAME_SLOT_RVA     UINT64_C(0x14D0B860)
+/* In 1206 il2cpp_string_new_len was a real callable at 0x0448d3b0 (2064 BL
+ * callers).  In 1224 the compiler INLINED it: the body logic survives
+ * mid-function at 0x448b040 (no prologue, reached via fallthrough, 0 BL
+ * callers), and no standalone callable (char*,len)->Il2CppString* exists in
+ * the RX segment.  The RVA below (0x0413F2CC) is a string-COPY constructor
+ * (takes Il2CppString*, not char*+len); calling it as string_new_len made the
+ * repair fallback interpret ASCII bytes as a pointer and crash.  It is kept
+ * only for the historical bounds-check name and is never called; the NRO
+ * reimplements the helper via the game's own GC helpers below. */
 #define GENSHIN_IL2CPP_STRING_NEW_LEN_RVA UINT64_C(0x0413F2CC)
+/* The 1224 Il2CppString construction sequence, verified at the game's own
+ * "\n"-string builder RVA 0x79b9814:
+ *   type_ptr = 0x14966F50      (Il2CppString metadata holder; [holder]=class)
+ *   GC page  = 0x14DF2000      (Unity GC slab base, populated by nativeRender)
+ *   alloc_vtable = [GC page + 0x700]
+ *   type resolver 0x782A890    (x0=type_ptr -> x0=holder; [holder]=class)
+ *   sized alloc   0x4128E94    (x0=class,x1=size,x2=alloc_vtable -> obj)
+ * Object layout (verified by managed_string_equals):
+ *   int32 length @ +0x10, UTF-16 chars @ +0x14.
+ * Size = len*2 + 0x14 (header) + 0x2 (NUL).  The sized-alloc helper zeroes the
+ * user region ([obj+0x10, obj+size)) via memset(0x782f85c) before returning. */
+#define GENSHIN_IL2CPP_STRING_TYPE_PTR_RVA     UINT64_C(0x14966F50)
+#define GENSHIN_IL2CPP_GC_PAGE_RVA             UINT64_C(0x14DF2000)
+#define GENSHIN_IL2CPP_GC_ALLOC_VTABLE_OFFSET  UINT64_C(0x700)
+#define GENSHIN_IL2CPP_TYPE_RESOLVER_RVA       UINT64_C(0x782A890)
+#define GENSHIN_IL2CPP_SIZED_ALLOC_RVA         UINT64_C(0x4128E94)
+#define GENSHIN_IL2CPP_STRING_HEADER_BYTES     UINT64_C(0x14)
+#define GENSHIN_IL2CPP_STRING_TERM_BYTES       UINT64_C(0x2)
 #define GENSHIN_COMBO_CLASS_NAME          "com.mihoyo.combosdk.ComboForUnity"
 #define GENSHIN_JAVA_FOR_NAME             "forName"
 
