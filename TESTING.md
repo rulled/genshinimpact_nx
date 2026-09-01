@@ -1,7 +1,9 @@
 # Native hardware smoke test
 
-> **Client 1224 upgrade in progress:** do not deploy this branch until all
-> pinned binary RVAs and fingerprints have been revalidated for 7.0.0.
+> **Client 1224 (Genshin 7.0.0) verified 2026-09-02:** this branch reaches the
+> account-login screen on real Switch hardware (Hoyoverse logo → Genshin logo
+> → login screen, steady heartbeat at frame 1320, `used=2591M/total=3093M`).
+> The pinned binary RVAs and fingerprints below are the validated 7.0.0 set.
 
 This procedure tests the Horizon/libnx wrapper only. It does not require or
 configure a private game server.
