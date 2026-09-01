@@ -1196,8 +1196,16 @@ static void act_void(void *recv, const FakeID *id, va_list va) {
     return;
   }
   if (!strcmp(id->name, "finish") || name_has(id->name, "appEnd") ||
-      name_has(id->name, "exitApp"))
+      name_has(id->name, "exitApp")) {
     jni_quit_requested = 1;
+    FILE *lf = fopen(GAME_HOME "/run_log.txt", "ab");
+    if (lf) {
+      fprintf(lf, "[I] jni: quit requested via '%s' (cls=%s)\n",
+              id->name, id->cls);
+      fflush(lf);
+      fclose(lf);
+    }
+  }
 }
 
 static void *dispatch_object_raw(void *recv, const FakeID *id, va_list va) {
@@ -2388,6 +2396,14 @@ int jni_exception_pending(void) { return pending_exception != NULL; }
 void jni_exception_clear(void) { set_pending_exception(NULL); }
 static void j_FatalError(void *env, const char *message) {
   (void)env; fprintf(stderr, "JNI fatal error: %s\n", message ? message : "(no message)"); jni_quit_requested = 1;
+  {
+    FILE *lf = fopen(GAME_HOME "/run_log.txt", "ab");
+    if (lf) {
+      fprintf(lf, "[F] jni: fatal error: %s\n", message ? message : "(no message)");
+      fflush(lf);
+      fclose(lf);
+    }
+  }
 }
 static juint j_MonitorEnter(void *env, void *obj) { (void)env; return obj ? JNI_OK : (juint)JNI_ERR; }
 static juint j_MonitorExit(void *env, void *obj) { (void)env; return obj ? JNI_OK : (juint)JNI_ERR; }

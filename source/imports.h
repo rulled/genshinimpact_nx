@@ -111,4 +111,6 @@ int pthread_storage_self_test(void);
 
 void resolve_module_imports(so_module *mod);
 
+extern const char *g_abort_source;
+
 #endif

@@ -13,6 +13,10 @@
 
 #include "config.h"
 #include "libc_shim.h"
+#include "memory_broker.h"
+#include "sbrk_extend.h"
+
+#define NX_EXC_MIB(bytes) ((unsigned long long)((bytes) / (1024ull * 1024ull)))
 
 #define NX_EXCEPTION_STACK_BYTES 0x8000u
 #define NX_EXCEPTION_MAX_FRAMES  16u
@@ -134,6 +138,54 @@ void __libnx_exception_handler(ThreadExceptionDump *context) {
     exception_print_address(file, label, frame[1]);
     frame_pointer = frame[0];
   }
+
+  /* Memory-attribution snapshot.  The original crash pattern was a process-wide
+   * OOM (Unity failed a sub-MiB allocation near the ~3 GiB ceiling), so record
+   * where committed pages went: the dlmalloc-via-sbrk donor draw, guest spill,
+   * the host broker spill, and the raw donor/pool residency. */
+  NxSparseArenaDiagnostics diag = {0};
+  nx_sparse_arena_get_diagnostics(&diag);
+  fprintf(file,
+          "pool backend=%u committed=%lluMiB peak_committed=%lluMiB "
+          "pool_free=%lluMiB largest_free=%lluMiB\n",
+          diag.backing_backend,
+          NX_EXC_MIB(diag.committed_bytes),
+          NX_EXC_MIB(diag.peak_committed_bytes),
+          NX_EXC_MIB(diag.pool_free_bytes),
+          NX_EXC_MIB(diag.pool_largest_free_bytes));
+  fprintf(file,
+          "spill guest=%lluMiB/peak=%lluMiB host=%lluMiB/peak=%lluMiB "
+          "thread=%lluMiB/peak=%lluMiB\n",
+          NX_EXC_MIB(diag.spill_bytes), NX_EXC_MIB(diag.peak_spill_bytes),
+          NX_EXC_MIB(diag.host_spill_bytes),
+          NX_EXC_MIB(diag.peak_host_spill_bytes),
+          NX_EXC_MIB(diag.thread_pool_bytes),
+          NX_EXC_MIB(diag.peak_thread_pool_bytes));
+  fprintf(file,
+          "donor cap=%lluMiB active=%lluMiB used=%lluMiB/peak=%lluMiB "
+          "grow=%llu shrink=%llu last_resize=0x%x\n",
+          NX_EXC_MIB(diag.donor_capacity_bytes),
+          NX_EXC_MIB(diag.donor_active_bytes),
+          NX_EXC_MIB(diag.donor_used_bytes),
+          NX_EXC_MIB(diag.donor_peak_used_bytes),
+          (unsigned long long)diag.donor_grow_calls,
+          (unsigned long long)diag.donor_shrink_calls,
+          diag.donor_last_resize_result);
+  fprintf(file,
+          "alloc_failures guest=%llu host=%llu thread=%llu "
+          "guest_backing=%lluMiB dynamic_mapped=%lluMiB/peak=%lluMiB\n",
+          (unsigned long long)diag.guest_allocation_failures,
+          (unsigned long long)diag.host_allocation_failures,
+          (unsigned long long)diag.thread_allocation_failures,
+          NX_EXC_MIB(diag.guest_backing_bytes),
+          NX_EXC_MIB(diag.dynamic_mapped_bytes),
+          NX_EXC_MIB(diag.peak_dynamic_mapped_bytes));
+  fprintf(file, "backing_unmap ok=%llu fail=%llu\n",
+          (unsigned long long)diag.backing_unmap_ok,
+          (unsigned long long)diag.backing_unmap_fail);
+  sbrk_extension_report(file);
+  memory_broker_histogram_report(file);
+
   fflush(file);
   fclose(file);
 }

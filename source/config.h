@@ -1,4 +1,4 @@
-/* Genshin Impact 6.7.0 Switch wrapper configuration. */
+/* Genshin Impact 7.0.0 Switch wrapper configuration. */
 
 #ifndef __CONFIG_H__
 #define __CONFIG_H__
@@ -27,12 +27,19 @@
 #define OC_HEAP_DONOR_GROW_BYTES    ((size_t)256 * 1024 * 1024)
 #define OC_HEAP_DONOR_SHRINK_BYTES  OC_HEAP_DONOR_GROW_BYTES
 #define SO_REGION_BYTES     ((size_t) 416 * 1024 * 1024)
+/* Public host allocations at or above this size are served straight from the
+ * reclaimable sparse pool instead of newlib's dlmalloc.  Newlib-internal
+ * allocations (open_memstream, FILE glue) bypass every wrapper and die with
+ * ENOMEM once dlmalloc saturates, so the primary heap must stay small.
+ * Histogram data from the login-burst NAK panic showed 472 MiB peak-live in
+ * dlmalloc, with 465 MiB in >=16 MiB blocks while the pool held GiBs free. */
+#define OC_BROKER_LARGE_ALLOC_BYTES ((size_t)1 * 1024 * 1024)
 
 #define SS_PACKAGE        "com.miHoYo.GenshinImpact"
-#define SS_VERSION_CODE   1206
-#define SS_VERSION_NAME   "6.7.0_45486583_45768959"
+#define SS_VERSION_CODE   1224
+#define SS_VERSION_NAME   "7.0.0_47144228_47194594"
 
-/* Exact values returned by the bundled 6.7.0 Combo InfoModule.  They are
+/* Exact values returned by the bundled 7.0.0 Combo InfoModule.  They are
  * sourced from assets/channel_config_v1.5.json for the reviewed client, not
  * account credentials or server-issued login data. */
 #define GENSHIN_CHANNEL_ID_TEXT      "1"

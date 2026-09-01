@@ -1,4 +1,4 @@
-/* Genshin Impact 6.7.0 Android/Unity host for Nintendo Switch (libnx). */
+/* Genshin Impact 7.0.0 Android/Unity host for Nintendo Switch (libnx). */
 
 #include <switch.h>
 #include <SDL2/SDL.h>
@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -26,8 +27,11 @@
 #include "imports.h"
 #include "jni_fake.h"
 #include "libc_shim.h"
+#include "memory_broker.h"
 #include "opensles.h"
+#include "panic_capture.h"
 #include "plugin_loader.h"
+#include "sbrk_extend.h"
 #include "so_util.h"
 #include "unity_entrypoints.h"
 #include "unity_jni.h"
@@ -37,8 +41,8 @@
 #define DATA_ROOT       GAME_HOME
 #define LIB_GAME        "lib/arm64-v8a/libyuanshen.so"
 #define JNI_VERSION_1_6 0x00010006
-#define STARTUP_METADATA_SIZE ((size_t)3731648)
-#define STARTUP_METADATA_MAP_SIZE ((size_t)0x390000)
+#define STARTUP_METADATA_SIZE ((size_t)3932952)
+#define STARTUP_METADATA_MAP_SIZE ((size_t)0x3c1000)
 #define NETWORK_BSD_SESSION_COUNT 16u
 
 void unity_environment_init(const char *data_root); /* unity_glue.c */
@@ -652,10 +656,10 @@ static void check_data(void) {
 
 static int exact_game_library_hash(void) {
   static const uint8_t expected[SHA256_HASH_SIZE] = {
-    0x9b,0x46,0x8b,0x51,0xcd,0xfc,0x75,0xe7,
-    0x10,0x0a,0x50,0x4e,0xe5,0x91,0xe3,0x77,
-    0xe8,0x32,0xef,0x34,0x97,0x66,0x83,0xe4,
-    0x49,0x4c,0x63,0x12,0x79,0xd9,0x92,0xa1,
+    0x26,0xc8,0x62,0xb1,0x47,0xd2,0x82,0x2a,
+    0x39,0xe5,0x46,0x4e,0x76,0x16,0x11,0x76,
+    0x7a,0xba,0xec,0x1a,0x54,0x16,0x98,0xac,
+    0x53,0xf8,0x0c,0x13,0x5a,0x9a,0x42,0xd1,
   };
   uint8_t *buffer = malloc(1024 * 1024);
   FILE *file = fopen(LIB_GAME, "rb");
@@ -679,26 +683,69 @@ static int loose_assets_present(void) {
          S_ISREG(st.st_mode);
 }
 
-/* First boot accepts the normal APK extraction layout directly.  It validates
- * the exact supported client before changing anything, creates and verifies a
- * transactional optimized pack, then deletes only the now-redundant loose
- * assets and Android packaging inputs.  A failed or interrupted pack retains
- * every loose source file, while a later launch can finish cleanup from the
- * already validated pack. */
-static void prepare_game_data(void) {
-  const int existing_pack = asset_pack_open_existing(DATA_ROOT);
-  const int loose_assets = loose_assets_present();
-  check_data();
-  if (!existing_pack) {
-    startup_status_update("Verifying the extracted Android client");
-    if (!exact_game_library_hash())
-      fatal_error("Unsupported libyuanshen.so. This wrapper requires SHA-256:\n%s",
-                  "9b468b51cdfc75e7100a504ee591e377e832ef34976683e4494c631279d992a1");
+static int client_metadata_version_matches(void) {
+  static const char path[] = DATA_ROOT "/no_backup/nx_client_version";
+  static const char expected[] = SS_VERSION_NAME "\n";
+  char actual[sizeof expected];
+  FILE *file = fopen(path, "rb");
+  if (!file) return 0;
+  const size_t got = fread(actual, 1, sizeof actual, file);
+  const int read_ok = !ferror(file);
+  const int close_ok = fclose(file) == 0;
+  return read_ok && close_ok && got == sizeof expected - 1u &&
+         !memcmp(actual, expected, sizeof expected - 1u);
+}
 
-    if (!asset_pack_build(DATA_ROOT "/assets", DATA_ROOT))
+static int update_client_metadata_version(void) {
+  static const char path[] = DATA_ROOT "/no_backup/nx_client_version";
+  static const char temporary[] =
+    DATA_ROOT "/no_backup/.nx_client_version.tmp";
+  static const char contents[] = SS_VERSION_NAME "\n";
+  FILE *file = fopen(temporary, "wb");
+  if (!file) return 0;
+  int ok = fwrite(contents, 1, sizeof contents - 1u, file) ==
+             sizeof contents - 1u &&
+           fflush(file) == 0 && fsync(fileno(file)) == 0;
+  if (fclose(file) != 0) ok = 0;
+  if (ok && rename(temporary, path) == 0) return 1;
+  /* FAT does not consistently replace an existing destination. */
+  if (ok && unlink(path) == 0 && rename(temporary, path) == 0) return 1;
+  unlink(temporary);
+  return 0;
+}
+
+static void refresh_client_metadata_cache(int assets_rebuilt) {
+  if (!assets_rebuilt && client_metadata_version_matches()) return;
+  if (!remove_data_child("files/il2cpp/Metadata/global-metadata.dat") ||
+      !remove_data_child("files/il2cpp/Metadata/startup-metadata.dat") ||
+      !update_client_metadata_version())
+    fatal_error("The client assets are valid, but stale IL2CPP metadata could not be invalidated.");
+}
+
+/* First boot and client upgrades accept the normal APK extraction layout
+ * directly.  The exact library is always verified, and a pack is reusable only
+ * when its header names this client version.  A replacement pack is fully
+ * written and verified before the old pair is changed; only then are stale
+ * derived metadata and redundant loose files removed. */
+static void prepare_game_data(void) {
+  const int loose_assets = loose_assets_present();
+  /* Loose assets are an explicit staging set.  Never let an older valid pack
+   * shadow them, even when both builds happen to share a versionCode. */
+  const int existing_pack = loose_assets
+    ? 0 : asset_pack_open_existing(DATA_ROOT, SS_VERSION_CODE);
+  check_data();
+
+  startup_status_update("Verifying the extracted Android client");
+  if (!exact_game_library_hash())
+    fatal_error("Unsupported libyuanshen.so. This wrapper requires SHA-256:\n%s",
+                "26c862b147d2822a39e5464e761611767abaec1a541698ac53f80c135a9a42d1");
+
+  if (!existing_pack) {
+    if (!asset_pack_build(DATA_ROOT "/assets", DATA_ROOT, SS_VERSION_CODE))
       fatal_error("Could not optimize the extracted APK assets. No source files were removed.\n\n%s",
                   asset_pack_error());
   }
+  refresh_client_metadata_cache(!existing_pack);
 
   if (loose_assets) {
     startup_status_update("Cleaning loose Android assets");
@@ -733,8 +780,8 @@ static void discard_incomplete_il2cpp_metadata_cache(void) {
  * releases its temporary arena mapping before constructors. */
 static void check_startup_metadata_mapping(void) {
   static const unsigned char expected_header[16] = {
-    0x01, 0x00, 0x00, 0x00, 0x46, 0x00, 0x00, 0x00,
-    0x46, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00,
+    0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
   };
   const char *path =
     "assets/bin/Data/Managed/Metadata/startup-metadata.dat";
@@ -801,7 +848,7 @@ static void check_global_metadata_digest_read(void) {
  * transparently traverses the optimized pack. */
 static void check_globalgamemanagers_seek_read(void) {
   static const unsigned char expected_header[32] = {
-    0x00, 0x00, 0x84, 0xea, 0x00, 0x1d, 0xed, 0x24,
+    0x00, 0x00, 0x84, 0xea, 0x00, 0x1e, 0x19, 0x94,
     0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x85, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x32, 0x30, 0x31, 0x37,
     0x2e, 0x34, 0x2e, 0x33, 0x30, 0x66, 0x31, 0x00,
@@ -917,7 +964,7 @@ static void initialize_sparse_arena(void) {
   (void)svcGetInfo(&alias_size, InfoType_AliasRegionSize,
                    CUR_PROCESS_HANDLE, 0);
   if (R_FAILED(svcGetInfo(&alias_extra, InfoType_AliasRegionExtraSize,
-                          CUR_PROCESS_HANDLE, 0)))
+                           CUR_PROCESS_HANDLE, 0)))
     alias_extra = 0;
   (void)svcGetInfo(&stack_address, InfoType_StackRegionAddress,
                    CUR_PROCESS_HANDLE, 0);
@@ -929,7 +976,53 @@ static void initialize_sparse_arena(void) {
                    CUR_PROCESS_HANDLE, 0);
   (void)svcGetInfo(&system_resource, InfoType_SystemResourceSizeTotal,
                    CUR_PROCESS_HANDLE, 0);
-  if (!prepared) return;
+  if (!prepared) {
+    extern const char *g_oc_arena_failure_stage;
+    const NxMemoryBackingBackend backend = nx_memory_backing_backend();
+    const size_t dyn_target = nx_dynamic_arena_target_bytes();
+    FILE *df = fopen(DATA_ROOT "/arena_debug.txt", "w");
+    if (df) {
+      fprintf(df, "failure_stage=%s\n", g_oc_arena_failure_stage);
+      fprintf(df, "backend=%d system_resource=0x%llx\n",
+              (int)backend, (unsigned long long)system_resource);
+      fprintf(df, "aslr_addr=0x%llx aslr_size=0x%llx (%llu MiB)\n",
+              (unsigned long long)aslr_address,
+              (unsigned long long)aslr_size,
+              (unsigned long long)(aslr_size / (1024 * 1024)));
+      fprintf(df, "alias_addr=0x%llx alias_size=0x%llx (%llu MiB) extra=0x%llx\n",
+              (unsigned long long)alias_address,
+              (unsigned long long)alias_size,
+              (unsigned long long)(alias_size / (1024 * 1024)),
+              (unsigned long long)alias_extra);
+      fprintf(df, "stack_addr=0x%llx stack_size=0x%llx (%llu MiB)\n",
+              (unsigned long long)stack_address,
+              (unsigned long long)stack_size,
+              (unsigned long long)(stack_size / (1024 * 1024)));
+      fprintf(df, "donor_capacity=0x%zx (%zu MiB) donor_active=0x%zx (%zu MiB)\n",
+              g_heap_donor_capacity, g_heap_donor_capacity / (1024 * 1024),
+              g_heap_donor_active_bytes, g_heap_donor_active_bytes / (1024 * 1024));
+      fprintf(df, "oc_dynamic_arena_bytes=0x%zx (%zu MiB)\n",
+              (size_t)OC_DYNAMIC_ARENA_BYTES,
+              (size_t)OC_DYNAMIC_ARENA_BYTES / (1024 * 1024));
+      fprintf(df, "unity_slab_bytes=0x%llx (%llu MiB)\n",
+              (unsigned long long)GENSHIN_UNITY_SLAB_MAP_BYTES,
+              (unsigned long long)(GENSHIN_UNITY_SLAB_MAP_BYTES / (1024 * 1024)));
+      fprintf(df, "large_search=0x%llx (%llu MiB)\n",
+              (unsigned long long)((u64)OC_DYNAMIC_ARENA_BYTES +
+               (u64)GENSHIN_UNITY_SLAB_MAP_BYTES + MMAP_ARENA_ALIGN),
+              (unsigned long long)(((u64)OC_DYNAMIC_ARENA_BYTES +
+               (u64)GENSHIN_UNITY_SLAB_MAP_BYTES + MMAP_ARENA_ALIGN) /
+               (1024 * 1024)));
+      fprintf(df, "aslr_threshold=0x%llx (%llu GiB)\n",
+              (unsigned long long)((u64)2 * 1024 * 1024 * 1024),
+              (unsigned long long)2);
+      fprintf(df, "dyn_target=0x%zx (%zu MiB)\n",
+              dyn_target, dyn_target / (1024 * 1024));
+      fprintf(df, "oc_want=%d\n", g_oc_want);
+      fclose(df);
+    }
+    return;
+  }
   g_oc_want = 2;
 }
 
@@ -1226,30 +1319,30 @@ static void patch_unity_java_class_resolution(void) {
     UINT32_C(0x528005e2), /* mov w2, #0x2f */
   };
   static const uint32_t expected_generic[] = {
-    UINT32_C(0xb4000160), UINT32_C(0xf9400288),
-    UINT32_C(0xb940ad08), UINT32_C(0x34000328),
-    UINT32_C(0x9000dee9), UINT32_C(0xf945d929),
-    UINT32_C(0xf9400129), UINT32_C(0x8b080120),
-    UINT32_C(0xf94002a1), UINT32_C(0x96c3d973),
-    UINT32_C(0x360002c0), UINT32_C(0xb9401a88),
-    UINT32_C(0x340002e8), UINT32_C(0xf9001295),
-    UINT32_C(0xb40002d3), UINT32_C(0xd000ce28),
-    UINT32_C(0xb000d809), UINT32_C(0xf9401100),
+    UINT32_C(0xb40001e0), UINT32_C(0xf9400288),
+    UINT32_C(0xb940b108), UINT32_C(0x340003a8),
+    UINT32_C(0x90017e69), UINT32_C(0xf941d529),
+    UINT32_C(0xf9400129), UINT32_C(0x8b080128),
+    UINT32_C(0xf9400001), UINT32_C(0xaa0003f5),
+    UINT32_C(0xaa0803e0), UINT32_C(0x9767b7a9),
+    UINT32_C(0x2a0003e8), UINT32_C(0xaa1503e0),
+    UINT32_C(0x360003c8), UINT32_C(0xb9401a88),
+    UINT32_C(0x34000288), UINT32_C(0xf9001280),
   };
   static const uint32_t patched_generic[] = {
     UINT32_C(0xb4000420), /* null string -> existing exception path */
     UINT32_C(0xaa1503e0), /* mov x0, x21 */
-    UINT32_C(0x97ff858f), /* bl AndroidJNISafe.FindClass, RVA 0x141A0430 */
+    UINT32_C(0x9767f134), /* bl AndroidJNISafe.FindClass veneer, RVA 0x0F823298 */
     UINT32_C(0xb40003c0), /* null jclass -> existing exception path */
     UINT32_C(0xaa0003f4), /* mov x20, x0 (owned local jclass) */
-    UINT32_C(0xb000c7a8), /* adrp x8, AndroidJavaClass metadata page */
-    UINT32_C(0xf9437908), /* ldr x8, [x8, #0x6f0] */
+    UINT32_C(0xd0016608), /* adrp x8, AndroidJavaClass metadata page */
+    UINT32_C(0xf943d508), /* ldr x8, [x8, #0x7a8] */
     UINT32_C(0xaa0803e0), /* mov x0, x8 */
-    UINT32_C(0x96c3d977), /* bl il2cpp_object_new, RVA 0x0F2B53E8 */
+    UINT32_C(0x9767b7b2), /* bl il2cpp_object_new, RVA 0x0F814CA8 */
     UINT32_C(0xb4000320), /* allocation failure -> existing exception path */
     UINT32_C(0xaa0003f3), /* mov x19, x0 */
     UINT32_C(0xaa1403e1), /* mov x1, x20 */
-    UINT32_C(0x97ff607c), /* bl AndroidJavaClass(IntPtr), RVA 0x1419700C */
+    UINT32_C(0x97580e92), /* bl AndroidJavaClass(IntPtr), RVA 0x0F42A838 */
     UINT32_C(0xaa1303e0), /* mov x0, x19 */
     UINT32_C(0xa9424ff4), /* ldp x20, x19, [sp, #32] */
     UINT32_C(0xa94157f6), /* ldp x22, x21, [sp, #16] */
@@ -1263,10 +1356,10 @@ static void patch_unity_java_class_resolution(void) {
   _Static_assert(sizeof(expected_generic) == sizeof(patched_generic),
                  "Java class resolver patch size changed");
   _Static_assert((GENSHIN_JAVA_CLASS_GENERIC_CALL_RVA + 8u * 4u) -
-                   GENSHIN_IL2CPP_OBJECT_NEW_RVA == UINT64_C(0x4F09A24),
+                   GENSHIN_IL2CPP_OBJECT_NEW_RVA == UINT64_C(0x2612138),
                  "il2cpp_object_new branch displacement changed");
   _Static_assert((GENSHIN_JAVA_CLASS_GENERIC_CALL_RVA + 12u * 4u) -
-                   GENSHIN_ANDROIDJAVACLASS_CTOR_RVA == UINT64_C(0x27E10),
+                   GENSHIN_ANDROIDJAVACLASS_CTOR_RVA == UINT64_C(0x29fc5b8),
                  "AndroidJavaClass constructor branch displacement changed");
 
   if (!module_contains(replace_chars, sizeof(expected_replace)) ||
@@ -1301,9 +1394,9 @@ static void patch_unity_slab_activation(void) {
     (uintptr_t)game_mod.load_virtbase +
     GENSHIN_UNITY_SLAB_ACTIVATE_SEQUENCE_RVA);
   static const uint32_t expected[] = {
-    UINT32_C(0xf008d728), /* adrp x8, aligned slab global */
+    UINT32_C(0xd0085968), /* adrp x8, aligned slab global */
     UINT32_C(0x92403ee9), /* and x9, x23, #0xffff */
-    UINT32_C(0xf943c908), /* ldr x8, [x8, #0x790] */
+    UINT32_C(0xf947c908), /* ldr x8, [x8, #0xf90] */
     UINT32_C(0xab095d1a), /* adds x26, x8, x9, lsl #23 */
   };
   struct {
@@ -1331,8 +1424,13 @@ static void patch_unity_slab_activation(void) {
     fatal_error("Could not install the Unity slab on-demand commit bridge.");
 }
 
-typedef void *(*GenshinIl2CppStringNewLenFn)(const char *, int32_t);
+/* 1224 inlined il2cpp_string_new_len, so the NRO reimplements it via the
+ * game's own GC helpers (see genshin_il2cpp_string_new_len). */
+typedef void *(*GenshinIl2CppTypeResolverFn)(void *type_ptr);
+typedef void *(*GenshinIl2CppSizedAllocFn)(void *klass, uint32_t size,
+                                           void *alloc_vtable);
 static int readable_object_span(const void *object, size_t bytes);
+static void *genshin_il2cpp_string_new_len(const char *ascii, int32_t length);
 
 /* Runtime continuation consumed by the caller-scoped naked dispatcher below.
  * It is published only after the exact source image and the replaced
@@ -1360,7 +1458,7 @@ static int managed_path_to_ascii(const void *object, char *output,
   return 1;
 }
 
-/* Reproduce the exact managed sequence replaced at RVA 0x96C4324.  Only its
+/* Reproduce the exact managed sequence replaced at RVA 0xC684DD4.  Only its
  * application-path input is normalized; the original Unity getter and both
  * original System.IO.Path implementations still execute.  Keeping this at the
  * Mmoron call site avoids changing exception/unwind behavior for any unrelated
@@ -1401,10 +1499,8 @@ void *genshin_mmoron_directory_sequence_bridge(void *parameters) {
 
   void *selected = path;
   if (!readable || strcmp(normalized, original)) {
-    GenshinIl2CppStringNewLenFn string_new_len =
-      (GenshinIl2CppStringNewLenFn)(module_base +
-                                    GENSHIN_IL2CPP_STRING_NEW_LEN_RVA);
-    selected = string_new_len(normalized, (int32_t)strlen(normalized));
+    selected = genshin_il2cpp_string_new_len(normalized,
+                                             (int32_t)strlen(normalized));
     if (!selected) selected = path;
   }
 
@@ -1426,10 +1522,10 @@ static void patch_mmoron_managed_directory_path(void) {
     (uintptr_t)game_mod.load_virtbase +
     GENSHIN_MMORON_DIRECTORY_SEQUENCE_RVA);
   static const uint32_t expected[] = {
-    UINT32_C(0x96ba08e4), /* bl Unity application-path getter */
-    UINT32_C(0x956fab22), /* bl Path.GetDirectoryName thunk */
+    UINT32_C(0x94b69a7c), /* bl Unity application-path getter thunk */
+    UINT32_C(0x9777f80f), /* bl Path.GetDirectoryName */
     UINT32_C(0xf9404e81), /* ldr x1, [x20, #0x98] */
-    UINT32_C(0x956faaf9), /* bl Path.Combine thunk */
+    UINT32_C(0x9777f659), /* bl Path.Combine */
   };
   struct {
     uint32_t ldr_x16_literal;
@@ -1465,6 +1561,62 @@ static int readable_object_span(const void *object, size_t bytes) {
       address - info.addr > info.size - bytes)
     return 0;
   return 1;
+}
+
+/* Reimplemented il2cpp_string_new_len for the 1224 client.  The original
+ * helper was inlined by the compiler (no callable (char*,len)->Il2CppString*
+ * exists in the RX segment), so the legacy GENSHIN_IL2CPP_STRING_NEW_LEN_RVA
+ * cannot be used.  This replicates the game's own Il2CppString construction at
+ * RVA 0x79b9814 via its native GC helpers:
+ *   1. load the Il2CppString alloc-vtable from the GC slab (page + 0x700);
+ *   2. resolve the type holder (0x782A890) and read [holder] for the class;
+ *   3. sized-allocate (0x4128E94) with size = len*2 + 0x14 + 0x2;
+ *   4. store the int32 length @ +0x10 and zero-extend ASCII to UTF-16 @ +0x14.
+ * Returns a GC-managed Il2CppString* or NULL when the GC slab/type is not yet
+ * initialized (callers treat NULL as a repair failure). */
+static void *genshin_il2cpp_string_new_len(const char *ascii, int32_t length) {
+  if (!ascii || length < 0 || length > 0x7fff)
+    return NULL;
+  const uintptr_t base = (uintptr_t)game_mod.load_virtbase;
+  void **const gc_vtable_slot = (void **)(base +
+    GENSHIN_IL2CPP_GC_PAGE_RVA + GENSHIN_IL2CPP_GC_ALLOC_VTABLE_OFFSET);
+  void *const *const type_holder =
+    (void *const *)(base + GENSHIN_IL2CPP_STRING_TYPE_PTR_RVA);
+  if (!module_contains(gc_vtable_slot, sizeof(*gc_vtable_slot)) ||
+      !module_contains(type_holder, sizeof(*type_holder)) ||
+      !module_contains((const void *)(base + GENSHIN_IL2CPP_TYPE_RESOLVER_RVA), 4) ||
+      !module_contains((const void *)(base + GENSHIN_IL2CPP_SIZED_ALLOC_RVA), 4))
+    return NULL;
+  void *const alloc_vtable = __atomic_load_n(gc_vtable_slot, __ATOMIC_ACQUIRE);
+  if (!alloc_vtable)
+    return NULL;
+  GenshinIl2CppTypeResolverFn resolve_type =
+    (GenshinIl2CppTypeResolverFn)(base + GENSHIN_IL2CPP_TYPE_RESOLVER_RVA);
+  void *holder = resolve_type((void *)type_holder);
+  if (!holder)
+    return NULL;
+  void *klass = __atomic_load_n((void *volatile *)holder, __ATOMIC_ACQUIRE);
+  if (!klass)
+    return NULL;
+  const uint32_t size = (uint32_t)length * 2u +
+                        (uint32_t)GENSHIN_IL2CPP_STRING_HEADER_BYTES +
+                        (uint32_t)GENSHIN_IL2CPP_STRING_TERM_BYTES;
+  GenshinIl2CppSizedAllocFn sized_alloc =
+    (GenshinIl2CppSizedAllocFn)(base + GENSHIN_IL2CPP_SIZED_ALLOC_RVA);
+  void *object = sized_alloc(klass, size, alloc_vtable);
+  if (!object)
+    return NULL;
+  /* int32 length @ +0x10 */
+  memcpy((uint8_t *)object + 0x10, &length, sizeof(length));
+  /* ASCII -> zero-extended UTF-16 @ +0x14, NUL-terminated */
+  uint8_t *const chars = (uint8_t *)object + 0x14;
+  for (int32_t i = 0; i < length; ++i) {
+    chars[2 * i] = (uint8_t)ascii[i];
+    chars[2 * i + 1] = 0;
+  }
+  chars[2 * length] = 0;
+  chars[2 * length + 1] = 0;
+  return object;
 }
 
 static int writable_object_span(const void *object, size_t bytes) {
@@ -1625,38 +1777,60 @@ static int managed_string_equals(const void *object, const char *ascii,
  * null or non-matching value. */
 static void repair_combo_managed_class_name(void) {
   const uintptr_t module_base = (uintptr_t)game_mod.load_virtbase;
-  void **const class_name_slot =
-    (void **)(module_base + GENSHIN_COMBO_CLASS_NAME_SLOT_RVA);
+  /* The Combo class-name slot is an IL2CPP metadata-field pointer reached
+   * through a runtime double indirection, so it has no statically derivable
+   * RVA for an arbitrary recompiled image.  The sentinel UINT64_MAX marks it
+   * unresolved; the Combo-name repair below is then skipped (IL2CPP's own
+   * MiHoYoSDK.Awake has already populated the slot before this runs). */
+  const int combo_slot_known =
+    GENSHIN_COMBO_CLASS_NAME_SLOT_RVA != UINT64_C(0xFFFFFFFFFFFFFFFF);
+  void **const class_name_slot = combo_slot_known
+    ? (void **)(module_base + GENSHIN_COMBO_CLASS_NAME_SLOT_RVA)
+    : NULL;
   void **const for_name_slot =
     (void **)(module_base + GENSHIN_JAVA_FOR_NAME_SLOT_RVA);
   void *const *const empty_args_slot =
     (void *const *)(module_base + GENSHIN_EMPTY_OBJECT_ARGS_SLOT_RVA);
-  const uintptr_t string_new_len_address =
-    module_base + GENSHIN_IL2CPP_STRING_NEW_LEN_RVA;
-  if (!module_contains(class_name_slot, sizeof(*class_name_slot)) ||
-      !module_contains(for_name_slot, sizeof(*for_name_slot)) ||
+  /* 1224 inlined il2cpp_string_new_len, so the legacy
+   * GENSHIN_IL2CPP_STRING_NEW_LEN_RVA is not a callable helper.  The repair
+   * fallback below uses genshin_il2cpp_string_new_len (which drives the game's
+   * own GC helpers); verify those RVAs land in the exact client image. */
+  const uintptr_t type_resolver_address =
+    module_base + GENSHIN_IL2CPP_TYPE_RESOLVER_RVA;
+  const uintptr_t sized_alloc_address =
+    module_base + GENSHIN_IL2CPP_SIZED_ALLOC_RVA;
+  /* The forName slot, the empty-args slot, and the GC helpers are all
+   * statically verified; a miss here is a real version mismatch. */
+  if (!module_contains(for_name_slot, sizeof(*for_name_slot)) ||
       !module_contains(empty_args_slot, sizeof(*empty_args_slot)) ||
-      !module_contains((const void *)string_new_len_address, 4) ||
-      (string_new_len_address & 3u))
+      !module_contains((const void *)type_resolver_address, 4) ||
+      (type_resolver_address & 3u) ||
+      !module_contains((const void *)sized_alloc_address, 4) ||
+      (sized_alloc_address & 3u))
     fatal_error("MiHoYoSDK managed bootstrap RVAs are outside the exact client image.");
+  if (combo_slot_known &&
+      !module_contains(class_name_slot, sizeof(*class_name_slot)))
+    fatal_error("MiHoYoSDK Combo class-name slot is outside the exact client image.");
 
   static const char class_name[] = GENSHIN_COMBO_CLASS_NAME;
   _Static_assert(sizeof(class_name) - 1u == 33u,
                  "exact Combo bridge class-name length changed");
-  void *current = __atomic_load_n(class_name_slot, __ATOMIC_ACQUIRE);
-  if (managed_string_equals(current, class_name, sizeof(class_name) - 1u)) {
-  } else {
-    GenshinIl2CppStringNewLenFn string_new_len =
-      (GenshinIl2CppStringNewLenFn)string_new_len_address;
-    void *const created =
-      string_new_len(class_name, (int32_t)(sizeof(class_name) - 1u));
-    if (!created ||
-        !managed_string_equals(created, class_name, sizeof(class_name) - 1u))
-      fatal_error("IL2CPP returned an invalid MiHoYoSDK class-name string.");
+  void *current = NULL;
+  if (combo_slot_known) {
+    current = __atomic_load_n(class_name_slot, __ATOMIC_ACQUIRE);
+    if (managed_string_equals(current, class_name, sizeof(class_name) - 1u)) {
+    } else {
+      void *const created =
+        genshin_il2cpp_string_new_len(class_name,
+                                      (int32_t)(sizeof(class_name) - 1u));
+      if (!created ||
+          !managed_string_equals(created, class_name, sizeof(class_name) - 1u))
+        fatal_error("IL2CPP returned an invalid MiHoYoSDK class-name string.");
 
-    void *expected = current;
-    (void)__atomic_compare_exchange_n(class_name_slot, &expected, created, 0,
-                                      __ATOMIC_RELEASE, __ATOMIC_ACQUIRE);
+      void *expected = current;
+      (void)__atomic_compare_exchange_n(class_name_slot, &expected, created, 0,
+                                        __ATOMIC_RELEASE, __ATOMIC_ACQUIRE);
+    }
   }
 
   static const char for_name[] = GENSHIN_JAVA_FOR_NAME;
@@ -1665,10 +1839,9 @@ static void repair_combo_managed_class_name(void) {
   current = __atomic_load_n(for_name_slot, __ATOMIC_ACQUIRE);
   if (managed_string_equals(current, for_name, sizeof(for_name) - 1u)) {
   } else {
-    GenshinIl2CppStringNewLenFn string_new_len =
-      (GenshinIl2CppStringNewLenFn)string_new_len_address;
     void *const created =
-      string_new_len(for_name, (int32_t)(sizeof(for_name) - 1u));
+      genshin_il2cpp_string_new_len(for_name,
+                                    (int32_t)(sizeof(for_name) - 1u));
     if (!created ||
         !managed_string_equals(created, for_name, sizeof(for_name) - 1u))
       fatal_error("IL2CPP returned an invalid JavaLangClass forName string.");
@@ -1734,9 +1907,9 @@ static void validate_unity_slab_client_state(const void *reservation,
  * before constructors can create collector threads and reach those offsets.
  * The fingerprints are immutable AArch64 instructions in the executable LOAD
  * segment, so Android relocations do not rewrite them. */
-#define GENSHIN_EXACT_LOAD_SIZE ((size_t)UINT64_C(0x161e0000))
+#define GENSHIN_EXACT_LOAD_SIZE ((size_t)UINT64_C(0x15240000))
 #define GENSHIN_EXACT_SHA256 \
-  "9b468b51cdfc75e7100a504ee591e377e832ef34976683e4494c631279d992a1"
+  "26c862b147d2822a39e5464e761611767abaec1a541698ac53f80c135a9a42d1"
 
 typedef struct {
   uintptr_t rva;
@@ -1745,21 +1918,33 @@ typedef struct {
 
 static int supported_game_image(void) {
   static const GameFingerprint fingerprints[] = {
-    { UINT64_C(0x044b9e88),
+    /* FP1: GC-signal gate.  1206 adrp x8,#0x15d9b000; ldr w8,[x8,#0xa78]
+     * -> 1224 adrp x8,#0x14df3000; ldr w8,[x8,#0x230] (page + offset both
+     * relocated; the str x30/stp x20,x19 prologue is unchanged). */
+    { UINT64_C(0x044ca4e0),
       { 0xfe, 0x0f, 0x1e, 0xf8, 0xf4, 0x4f, 0x01, 0xa9,
-        0x08, 0xc7, 0x08, 0xd0, 0x08, 0x79, 0x4a, 0xb9 } },
-    { UINT64_C(0x044adad4),
-      { 0x00, 0xbc, 0xb8, 0x94, 0x80, 0xfe, 0xff, 0x34,
-        0x5f, 0x03, 0x00, 0xb9, 0xf2, 0xff, 0xff, 0x17 } },
-    { UINT64_C(0x044b4ca0),
-      { 0x8d, 0x9f, 0xb8, 0x94, 0x80, 0xfe, 0xff, 0x34,
-        0x3f, 0x03, 0x00, 0xb9, 0xf2, 0xff, 0xff, 0x17 } },
-    { UINT64_C(0x0448d3b0),
+        0x48, 0x49, 0x08, 0xb0, 0x08, 0x31, 0x42, 0xb9 } },
+    /* FP2/FP3: retry loops that BL the same PLT thunk (1206 0x72dcad4 ->
+     * 1224 0x7856f78; 6 callers in both).  The cbz w0; str wzr; b loop was
+     * reorganized to cbnz w0; add; add, and the GC metadata field moved from
+     * ldr w1,[xN,#0xa78] to ldr w1,[xN,#0x230]. */
+    { UINT64_C(0x044c00d4),
+      { 0xa9, 0x5b, 0xce, 0x94, 0xc0, 0x00, 0x00, 0x35,
+        0xd6, 0x06, 0x00, 0x91, 0x18, 0x23, 0x00, 0x91 } },
+    { UINT64_C(0x044c53b4),
+      { 0xf1, 0x46, 0xce, 0x94, 0xc0, 0x00, 0x00, 0x35,
+        0xb5, 0x06, 0x00, 0x91, 0xf7, 0x22, 0x00, 0x91 } },
+    /* FP4: il2cpp_string_new_len prologue.  Resolved by caller trace: 2064
+     * callers in 1206, 821 in 1224, with 64% post-BL instruction overlap.
+     * The 16-byte prologue is byte-identical to 1206. */
+    { UINT64_C(0x0413f2cc),
       { 0xff, 0x43, 0x01, 0xd1, 0xfe, 0x13, 0x00, 0xf9,
         0xf6, 0x57, 0x03, 0xa9, 0xf4, 0x4f, 0x04, 0xa9 } },
-    { UINT64_C(0x075977d8),
+    /* FP5: mov x20,x0; ldr x1,[x8,#0x5d0]; bl; adrp.  The first two
+     * instructions are byte-identical; unique 4-instruction window in 1224. */
+    { UINT64_C(0x0ea5dc20),
       { 0xf4, 0x03, 0x00, 0xaa, 0x01, 0xe9, 0x42, 0xf9,
-        0x52, 0x5f, 0xf4, 0x95, 0x20, 0x71, 0xfc, 0xd0 } },
+        0x6c, 0x15, 0x5e, 0x96, 0x88, 0x03, 0x03, 0xd0 } },
   };
 
   if (game_mod.load_size != GENSHIN_EXACT_LOAD_SIZE) return 0;
@@ -1846,9 +2031,261 @@ static void initialize_network_state(void) {
   g_net_on = socket_started != 0;
 }
 
+static volatile sig_atomic_t g_crash_signal = -1;
+static volatile sig_atomic_t g_render_frame = -1;
+static volatile sig_atomic_t g_render_in_progress;
+
+static size_t crash_report_append_text(char *report, size_t capacity,
+                                       size_t length, const char *text) {
+  while (*text && length < capacity) report[length++] = *text++;
+  return length;
+}
+
+static size_t crash_report_append_int(char *report, size_t capacity,
+                                      size_t length, int value) {
+  char digits[16];
+  size_t count = 0;
+  unsigned magnitude = (unsigned)value;
+  if (value < 0) {
+    if (length < capacity) report[length++] = '-';
+    magnitude = 0u - magnitude;
+  }
+  do {
+    digits[count++] = (char)('0' + magnitude % 10u);
+    magnitude /= 10u;
+  } while (magnitude && count < sizeof(digits));
+  while (count && length < capacity) report[length++] = digits[--count];
+  return length;
+}
+
+static void crash_signal_handler(int sig) {
+  g_crash_signal = sig;
+  const int fd = open(DATA_ROOT "/crash_signal.txt",
+                      O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd >= 0) {
+    char report[96];
+    size_t length = crash_report_append_text(report, sizeof(report), 0,
+                                             "signal=");
+    length = crash_report_append_int(report, sizeof(report), length, sig);
+    length = crash_report_append_text(report, sizeof(report), length,
+                                      " frame=");
+    length = crash_report_append_int(report, sizeof(report), length,
+                                     g_render_frame);
+    length = crash_report_append_text(report, sizeof(report), length,
+                                      " in_render=");
+    length = crash_report_append_int(report, sizeof(report), length,
+                                     g_render_in_progress);
+    if (length < sizeof(report)) report[length++] = '\n';
+    (void)write(fd, report, length);
+    close(fd);
+  }
+  _exit(sig);
+}
+
+static void log_crash_exit(const char *reason, void *caller_ra) {
+  FILE *f = fopen(DATA_ROOT "/crash_exit.txt", "w");
+  if (f) {
+    u64 used = 0, total = 0;
+    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    fprintf(f, "%s frame=%d in_render=%d used=%lluM total=%lluM\n", reason,
+            g_render_frame, g_render_in_progress,
+            (unsigned long long)(used / (1024 * 1024)),
+            (unsigned long long)(total / (1024 * 1024)));
+    fprintf(f, "il2cpp_base=0x%lx il2cpp_size=0x%lx\n",
+            (unsigned long)g_il2cpp_base,
+            (unsigned long)g_il2cpp_size);
+
+    extern void _start(void);
+    extern char __bss_end__[];
+    const uintptr_t host_base = (uintptr_t)&_start;
+    const uintptr_t host_end = (uintptr_t)__bss_end__;
+
+    /* Walk the stack via frame pointers starting from abort's caller. */
+    uintptr_t addrs[16];
+    int naddrs = 0;
+    if (caller_ra) addrs[naddrs++] = (uintptr_t)caller_ra;
+
+    /* Get abort()'s frame pointer and walk up. */
+    void *fp = __builtin_frame_address(0);
+    for (int depth = 0; depth < 14 && fp; depth++) {
+      uintptr_t fp_addr = (uintptr_t)fp;
+      MemoryInfo mi;
+      u32 pi;
+      if (R_FAILED(svcQueryMemory(&mi, &pi, fp_addr)) ||
+          !(mi.perm & Perm_R) || mi.type == MemType_Unmapped ||
+          fp_addr < mi.addr ||
+          sizeof(uint64_t) * 2 > (size_t)(mi.addr + mi.size - fp_addr))
+        break;
+      uint64_t frame[2];
+      memcpy(frame, fp, sizeof(frame));
+      if (frame[1]) addrs[naddrs++] = (uintptr_t)frame[1];
+      if (!frame[0] || frame[0] <= (uint64_t)fp_addr) break;
+      fp = (void *)(uintptr_t)frame[0];
+    }
+
+    for (int i = 0; i < naddrs; i++) {
+      uintptr_t a = addrs[i];
+      MemoryInfo mi;
+      u32 pi;
+      Result qr = svcQueryMemory(&mi, &pi, a);
+      if (g_il2cpp_base && a >= g_il2cpp_base &&
+          a - g_il2cpp_base < g_il2cpp_size) {
+        fprintf(f, "  bt%d=0x%lx guest+0x%lx", i,
+                (unsigned long)a, (unsigned long)(a - g_il2cpp_base));
+      } else if (a >= host_base && a < host_end) {
+        fprintf(f, "  bt%d=0x%lx host+0x%lx", i,
+                (unsigned long)a, (unsigned long)(a - host_base));
+      } else {
+        fprintf(f, "  bt%d=0x%lx absolute", i, (unsigned long)a);
+      }
+      if (R_SUCCEEDED(qr)) {
+        fprintf(f, " mem[addr=0x%lx size=0x%lx type=%d perm=0x%x]",
+                (unsigned long)mi.addr, (unsigned long)mi.size,
+                (int)mi.type, (unsigned)mi.perm);
+      }
+      fprintf(f, "\n");
+    }
+    fflush(f);
+    fclose(f);
+  }
+}
+
+void exit(int status) {
+  log_crash_exit(g_abort_source ? g_abort_source : "exit",
+                 __builtin_return_address(0));
+  _exit(status);
+}
+
+void abort(void) {
+  const char *reason = g_abort_source ? g_abort_source : "abort";
+  void *caller = __builtin_return_address(0);
+  register uintptr_t sp_val asm("sp");
+  FILE *f = fopen(DATA_ROOT "/crash_exit.txt", "w");
+  if (f) {
+    u64 used = 0, total = 0;
+    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    fprintf(f, "%s frame=%d in_render=%d used=%lluM total=%lluM\n", reason,
+            g_render_frame, g_render_in_progress,
+            (unsigned long long)(used / (1024 * 1024)),
+            (unsigned long long)(total / (1024 * 1024)));
+    fprintf(f, "il2cpp_base=0x%lx il2cpp_size=0x%lx\n",
+            (unsigned long)g_il2cpp_base,
+            (unsigned long)g_il2cpp_size);
+
+    extern void _start(void);
+    extern char __bss_end__[];
+    const uintptr_t host_base = (uintptr_t)&_start;
+    const uintptr_t host_end = (uintptr_t)__bss_end__;
+
+    fprintf(f, "caller=0x%lx\n", (unsigned long)(uintptr_t)caller);
+    if (caller) {
+      uintptr_t a = (uintptr_t)caller;
+      if (g_il2cpp_base && a >= g_il2cpp_base &&
+          a - g_il2cpp_base < g_il2cpp_size)
+        fprintf(f, "  caller=guest+0x%lx\n", (unsigned long)(a - g_il2cpp_base));
+      else if (a >= host_base && a < host_end)
+        fprintf(f, "  caller=host+0x%lx\n", (unsigned long)(a - host_base));
+      else
+        fprintf(f, "  caller=absolute\n");
+    }
+
+    fprintf(f, "stack scan sp=0x%lx:\n", (unsigned long)sp_val);
+    for (int i = 0; i < 1024; i++) {
+      uintptr_t addr = sp_val + (uintptr_t)i * 8;
+      MemoryInfo mi;
+      u32 pi;
+      if (R_FAILED(svcQueryMemory(&mi, &pi, addr)) ||
+          !(mi.perm & Perm_R) || mi.type == MemType_Unmapped ||
+          addr < mi.addr ||
+          sizeof(uint64_t) > (size_t)(mi.addr + mi.size - addr))
+        continue;
+      uint64_t val = *(uint64_t *)addr;
+      if (!val) continue;
+      if ((val >= host_base && val < host_end) ||
+          (g_il2cpp_base && val >= g_il2cpp_base &&
+           val < g_il2cpp_base + g_il2cpp_size)) {
+        fprintf(f, "  [sp+0x%x]=0x%llx", i * 8,
+                (unsigned long long)val);
+        if (val >= host_base && val < host_end)
+          fprintf(f, " host+0x%llx", (unsigned long long)(val - host_base));
+        else
+          fprintf(f, " guest+0x%llx",
+                  (unsigned long long)(val - g_il2cpp_base));
+        fprintf(f, "\n");
+      }
+    }
+    panic_capture_report(f);
+    {
+      NxSparseArenaDiagnostics diag = {0};
+      nx_sparse_arena_get_diagnostics(&diag);
+      const unsigned long long MiB = 1024ull * 1024ull;
+      fprintf(f,
+              "pool backend=%u committed=%lluMiB peak_committed=%lluMiB "
+              "pool_free=%lluMiB largest_free=%lluMiB\n",
+              diag.backing_backend,
+              diag.committed_bytes / MiB,
+              diag.peak_committed_bytes / MiB,
+              diag.pool_free_bytes / MiB,
+              diag.pool_largest_free_bytes / MiB);
+      fprintf(f,
+              "donor cap=%lluMiB active=%lluMiB used=%lluMiB/peak=%lluMiB "
+              "grow=%llu shrink=%llu last_resize=0x%x\n",
+              diag.donor_capacity_bytes / MiB,
+              diag.donor_active_bytes / MiB,
+              diag.donor_used_bytes / MiB,
+              diag.donor_peak_used_bytes / MiB,
+              (unsigned long long)diag.donor_grow_calls,
+              (unsigned long long)diag.donor_shrink_calls,
+              diag.donor_last_resize_result);
+      fprintf(f,
+              "alloc_failures guest=%llu host=%llu thread=%llu "
+              "dynamic_mapped=%lluMiB/peak=%lluMiB last_map=0x%x\n",
+              (unsigned long long)diag.guest_allocation_failures,
+              (unsigned long long)diag.host_allocation_failures,
+              (unsigned long long)diag.thread_allocation_failures,
+              diag.dynamic_mapped_bytes / MiB,
+              diag.peak_dynamic_mapped_bytes / MiB,
+              diag.last_map_result);
+      fprintf(f, "backing_unmap ok=%llu fail=%llu\n",
+              (unsigned long long)diag.backing_unmap_ok,
+              (unsigned long long)diag.backing_unmap_fail);
+    }
+    sbrk_extension_report(f);
+    memory_broker_histogram_report(f);
+    fflush(f);
+    fclose(f);
+  }
+  _exit(1);
+}
+
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
+
+  signal(SIGSEGV, crash_signal_handler);
+  signal(SIGABRT, crash_signal_handler);
+  signal(SIGILL, crash_signal_handler);
+  signal(SIGBUS, crash_signal_handler);
+  signal(SIGFPE, crash_signal_handler);
+
+  /* Host Rust (NVK/NAK) panics print their message with raw write(2).  Bind
+   * fd 2 to a durable file early so the payload survives instead of hitting
+   * the uninitialized software-console devoptab.  Guest writes to fd 1/2 keep
+   * flowing through the nx_write logging endpoints, unaffected. */
+  {
+    static char rust_backtrace_env[] = "RUST_BACKTRACE=1";
+    int err_fd = open(DATA_ROOT "/stderr.txt",
+                      O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (err_fd >= 0) {
+      if (err_fd != STDERR_FILENO) {
+        dup2(err_fd, STDERR_FILENO);
+        close(err_fd);
+      }
+    }
+    putenv(rust_backtrace_env);
+  }
 
   startup_status_begin("Validating the Android client");
   if (chdir(DATA_ROOT) != 0)
@@ -1856,6 +2293,11 @@ int main(int argc, char **argv) {
                 DATA_ROOT);
   make_runtime_dirs();
   unlink(DATA_ROOT "/fatal.txt");
+  unlink(DATA_ROOT "/run_log.txt");
+  unlink(DATA_ROOT "/crash_frame.txt");
+  unlink(DATA_ROOT "/crash_signal.txt");
+  unlink(DATA_ROOT "/crash_exit.txt");
+  unlink(DATA_ROOT "/arena_debug.txt");
 
   /* Validate the kernel-heap boundary before APK/asset-pack work performs any
    * ordinary allocations. */
@@ -2068,7 +2510,9 @@ int main(int argc, char **argv) {
   int unity_active = 1;
   int display_recreate_pending = 0;
   int first_render_done = 0;
-  while (appletMainLoop() && !jni_quit_requested) {
+  int frame_count = 0;
+  int applet_running = 1;
+  while ((applet_running = appletMainLoop()) && !jni_quit_requested) {
     const int now_focused = appletGetFocusState() == AppletFocusState_InFocus;
     if (android_native_update_mode()) {
       display_recreate_pending = 1;
@@ -2139,9 +2583,32 @@ int main(int argc, char **argv) {
       (uint8_t (*)(void *, void *, void *, int))unity_inject,
       fake_env, fake_unityplayer_thiz);
     jni_boundary_end();
+    if (frame_count % 120 == 0) {
+      NxSparseArenaDiagnostics diag = {0};
+      nx_sparse_arena_get_diagnostics(&diag);
+      FILE *lf = fopen(DATA_ROOT "/run_log.txt", "ab");
+      if (lf) {
+        const unsigned long long MiB = 1024ull * 1024ull;
+        fprintf(lf,
+                "[I] main: frame %d used=%lluM total=%lluM "
+                "donor=%lluM/%lluM mapped=%lluM unmap=%llu/%llu\n",
+                frame_count,
+                diag.system_used_memory_bytes / MiB,
+                diag.system_total_memory_bytes / MiB,
+                diag.donor_used_bytes / MiB,
+                diag.donor_active_bytes / MiB,
+                diag.dynamic_mapped_bytes / MiB,
+                (unsigned long long)diag.backing_unmap_ok,
+                (unsigned long long)diag.backing_unmap_fail);
+        fclose(lf);
+      }
+    }
+    g_render_frame = frame_count;
+    g_render_in_progress = 1;
     jni_boundary_begin("nativeRender");
     const int render_continues = unity_render(fake_env, fake_unityplayer_thiz);
     jni_boundary_end();
+    g_render_in_progress = 0;
     /* Exact-image call chain: nativeRender RVA 0x49c3cd4 reaches
      * 0x49bb288 -> 0x531ff84 -> 0x44974e8 -> 0x44ac054.  That final function
      * performs the 0x100800000-byte mmap through 0x44b5748 and publishes the
@@ -2151,6 +2618,7 @@ int main(int argc, char **argv) {
       validate_unity_slab_client_state(unity_slab_reservation,
                                        unity_slab_reservation_size);
     if (!render_continues) break;
+    ++frame_count;
     if (!first_render_done) {
       first_render_done = 1;
       repair_combo_managed_class_name();
@@ -2192,6 +2660,15 @@ int main(int argc, char **argv) {
       combo_auth_tick();
       write_thread_pointer(guest_thread_pointer);
     }
+  }
+
+  g_render_frame = frame_count;
+  FILE *lf = fopen(DATA_ROOT "/run_log.txt", "ab");
+  if (lf) {
+    fprintf(lf, "[I] main: render loop exited after %d frames "
+            "(jni_quit_requested=%d appletMainLoop=%d)\n",
+            frame_count, jni_quit_requested, applet_running);
+    fclose(lf);
   }
 
   opensles_set_focus(0);

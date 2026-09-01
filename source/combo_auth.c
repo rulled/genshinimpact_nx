@@ -22,7 +22,7 @@
 #include "json_min.h"
 
 /* These production endpoints and client identifiers are copied from the
- * reviewed 6.7.0 assets/server_env_config.json entry (area=os, env=2). */
+ * reviewed 7.0.0 assets/server_env_config.json entry (area=os, env=2). */
 #define PASSPORT_TLS_PREFLIGHT_URL \
   "https://hk4e-sdk-os.hoyoverse.com/hk4e_global/account/ma-passport/api/getConfig"
 #define PASSPORT_PASSWORD_URL \
@@ -662,14 +662,14 @@ static struct curl_slist *combo_headers(void) {
       append_header(&headers, "x-rpc-device_model: Nintendo+Switch") ||
       append_header(&headers, "x-rpc-client_type: 2") ||
       append_header(&headers, "x-rpc-language: en-us") ||
-      append_header(&headers, "x-rpc-channel_version: 2.52.0") ||
-      append_header(&headers, "x-rpc-mdk_version: 2.52.0") ||
+      append_header(&headers, "x-rpc-channel_version: 2.54.0") ||
+      append_header(&headers, "x-rpc-mdk_version: 2.54.0") ||
       append_header(&headers, "x-rpc-game_biz: hk4e_global") ||
       append_header(&headers, "x-rpc-channel_id: 1") ||
       append_header(&headers, "x-rpc-device_fp;") ||
       append_header(&headers, "x-rpc-lifecycle_id: %s", g_lifecycle_id) ||
       append_header(&headers, "x-rpc-app_id: %s", PASSPORT_APP_ID) ||
-      append_header(&headers, "x-rpc-combo_version: 2.52.0") ||
+      append_header(&headers, "x-rpc-combo_version: 2.54.0") ||
       append_header(&headers, "x-rpc-account_version: 2.3.0") ||
       append_header(&headers, "x-rpc-age_gate: true") ||
       append_header(&headers, "x-rpc-age_gate_eu: true") ||
@@ -713,7 +713,7 @@ static CURLcode http_post_json(const char *url, struct curl_slist *headers,
   curl_easy_setopt(curl, CURLOPT_CAINFO, CA_BUNDLE_PATH);
   curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
   curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-  curl_easy_setopt(curl, CURLOPT_USERAGENT, "GenshinImpact/6.7.0 Android");
+  curl_easy_setopt(curl, CURLOPT_USERAGENT, "GenshinImpact/7.0.0 Android");
   const CURLcode result = curl_easy_perform(curl);
   if (result == CURLE_OK)
     (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, http_status);
@@ -2218,7 +2218,7 @@ static void run_preflight(void) {
     curl_easy_setopt(curl, CURLOPT_CAINFO, CA_BUNDLE_PATH);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "GenshinImpact/6.7.0 Android");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "GenshinImpact/7.0.0 Android");
     result = curl_easy_perform(curl);
     if (result == CURLE_OK)
       (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);

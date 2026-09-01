@@ -1,9 +1,9 @@
-/* Exact-client bridge for guest RVA 0x44B5684.
+/* Exact-client bridge for guest RVA 0x44C5B20.
  *
  * The replaced selector was not a call site, so preserve every caller-saved
  * integer/SIMD register around the broker call.  Once the selected 8 MiB chunk
  * is physically resident, reproduce the original global load, index mask and
- * flag-setting add before resuming at RVA 0x44B5694. */
+ * flag-setting add before resuming at RVA 0x44C5B30. */
 
     .section .text.genshin_unity_slab_activate_dispatch,"ax",%progbits
     .p2align 2

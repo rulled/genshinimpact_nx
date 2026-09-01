@@ -1,4 +1,4 @@
-/* Native bridge for the exact libMHYComboCrypto.so shipped by Genshin 6.7.0. */
+/* Native bridge for the libMHYComboCrypto.so shipped by Genshin 7.0.0. */
 
 #include <stdarg.h>
 #include <stdio.h>
