@@ -1,5 +1,8 @@
 # Native hardware smoke test
 
+> **Client 1224 upgrade in progress:** do not deploy this branch until all
+> pinned binary RVAs and fingerprints have been revalidated for 7.0.0.
+
 This procedure tests the Horizon/libnx wrapper only. It does not require or
 configure a private game server.
 
@@ -14,11 +17,11 @@ configure a private game server.
 
 ```text
 Package: com.miHoYo.GenshinImpact
-VersionCode: 1206
-Version: 6.7.0_45486583_45768959
+VersionCode: 1224
+Version: 7.0.0_47144228_47194594
 Unity: 2017.4.30f1
 libyuanshen.so SHA-256:
-9b468b51cdfc75e7100a504ee591e377e832ef34976683e4494c631279d992a1
+26c862b147d2822a39e5464e761611767abaec1a541698ac53f80c135a9a42d1
 ```
 
 Do not use an official account for experimental wrapper testing.

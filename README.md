@@ -1,14 +1,16 @@
 <h1 align=center>Genshin Impact NX</h1>
 
 An experimental wrapper/port of the Android release of **Genshin Impact**
-(package `com.miHoYo.GenshinImpact`, version `6.7.0`, versionCode 1206). It loads
+(package `com.miHoYo.GenshinImpact`, version `7.0.0`, versionCode 1224). It loads
 the original game binary `libyuanshen.so` (Unity 2017.4 / IL2CPP), applies
 Android APS2 packed relocations and runs it inside a minimal Android-like
 environment natively on the Switch.
 
-The public Mesa 25.0.7 build has been verified to reach and remain responsive at
-the account-login screen. This is not a playable port: later game startup is
-still blocked by Genshin Impact's anti-cheat.
+The public Mesa 25.0.7 build was verified to reach and remain responsive at the
+account-login screen with the 6.7.0 baseline. Client 7.0.0 support is being
+revalidated on the `client-1224` branch and must not be treated as hardware-tested
+until its binary RVAs and fingerprints are updated. This is not a playable port:
+later game startup is still blocked by Genshin Impact's anti-cheat.
 
 It is published as a base for other Android Unity ports.
 

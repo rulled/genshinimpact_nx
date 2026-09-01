@@ -3,8 +3,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-int asset_pack_open_existing(const char *root);
-int asset_pack_build(const char *assets_root, const char *root);
+int asset_pack_open_existing(const char *root, uint32_t client_version);
+int asset_pack_build(const char *assets_root, const char *root,
+                     uint32_t client_version);
 int asset_pack_active(void);
 const char *asset_pack_error(void);
 

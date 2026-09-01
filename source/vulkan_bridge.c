@@ -434,8 +434,8 @@ nx_vkEnumerateInstanceLayerProperties(
 
 void *nx_vk_lookup(const char *name) {
   if (!name) return NULL;
-  /* Android's loader contract is dlsym-style, not GIPA(NULL)-style.  The exact
-   * 6.7.0 client requires this complete eight-symbol root set before it creates
+  /* Android's loader contract is dlsym-style, not GIPA(NULL)-style.  The
+   * supported client requires this complete eight-symbol root set before it creates
    * an instance; NVK correctly rejects the three instance/physical-device
    * commands when they are queried through vkGetInstanceProcAddr(NULL, ...). */
   if (strcmp(name, "vkGetInstanceProcAddr") == 0) return &nx_vkGetInstanceProcAddr;

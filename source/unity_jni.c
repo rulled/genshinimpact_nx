@@ -73,7 +73,7 @@ static int combo_complete_native_bridge_init(int callback_index) {
 }
 
 /* ConsentPrivacyPresenter.onAcceptNecessaryClicked is the privacy-preserving
- * terminal path in the reviewed 6.7.0 SDK: it stores both analytics and
+ * terminal path in the reviewed Combo SDK: it stores both analytics and
  * advertising as denied, then invokes callback(0, "", {shouldShowEdit:true}).
  * The Android SDK UI cannot be hosted by libnx, so reproduce only that
  * necessary-storage result for the initial "privacy" banner.  This does not

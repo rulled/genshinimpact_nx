@@ -16,7 +16,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 TARGET      := genshinimpact_nx
 APP_TITLE   := Genshin Impact NX
 APP_AUTHOR  := naga
-APP_VERSION := 6.7.0
+APP_VERSION := 7.0.0
 APP_ICON    := $(TOPDIR)/icon.jpg
 export APP_TITLE APP_AUTHOR APP_VERSION APP_ICON
 

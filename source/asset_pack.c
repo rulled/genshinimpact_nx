@@ -14,14 +14,16 @@
 #include "asset_pack.h"
 #include "error.h"
 
-#define PACK_VERSION 2u
+/* Version 3 binds a structurally valid pack to the exact Android client.  This
+ * prevents an upgrade from pairing a new libyuanshen.so with an old asset pack. */
+#define PACK_VERSION 3u
 #define PACK_HANDLES 512
 #define PACK_CACHE_SIZE (64u * 1024u)
 
 typedef struct {
   char magic[8];
   uint32_t version;
-  uint32_t reserved;
+  uint32_t client_version;
   uint64_t pack_id;
   uint64_t file_size;
   uint64_t data_checksum;
@@ -31,12 +33,17 @@ typedef struct {
   char magic[8];
   uint32_t version;
   uint32_t count;
+  uint32_t client_version;
+  uint32_t reserved;
   uint64_t pack_id;
   uint64_t pack_size;
   uint64_t paths_size;
   uint64_t checksum;
   uint64_t data_checksum;
 } IndexHeader;
+
+_Static_assert(sizeof(PackHeader) == 40u, "asset pack header ABI");
+_Static_assert(sizeof(IndexHeader) == 64u, "asset index header ABI");
 
 typedef struct {
   uint64_t offset;
@@ -240,8 +247,8 @@ static void free_loaded(DiskEntry *entries, char *paths, int fd) {
 }
 
 static int load_pair(const char *pack_path, const char *index_path,
-                     DiskEntry **entries_out, char **paths_out,
-                     size_t *count_out, int *fd_out) {
+                     uint32_t client_version, DiskEntry **entries_out,
+                     char **paths_out, size_t *count_out, int *fd_out) {
   int pack_fd = -1, index_fd = -1;
   DiskEntry *entries = NULL;
   char *paths = NULL;
@@ -261,6 +268,8 @@ static int load_pair(const char *pack_path, const char *index_path,
       memcmp(pack_header.magic, "GINXPAK1", 8) ||
       memcmp(index_header.magic, "GINXIDX1", 8) ||
       pack_header.version != PACK_VERSION || index_header.version != PACK_VERSION ||
+      pack_header.client_version != client_version ||
+      index_header.client_version != client_version ||
       pack_header.pack_id != index_header.pack_id ||
       pack_header.file_size != (uint64_t)pack_stat.st_size ||
       pack_header.data_checksum != index_header.data_checksum ||
@@ -320,7 +329,7 @@ failed:
   return 0;
 }
 
-int asset_pack_open_existing(const char *root) {
+int asset_pack_open_existing(const char *root, uint32_t client_version) {
   if (g_pack_fd >= 0) return 1;
   char pack_path[768], index_path[768];
   snprintf(pack_path, sizeof pack_path, "%s/assets.nxpack", root);
@@ -329,7 +338,9 @@ int asset_pack_open_existing(const char *root) {
   char *paths = NULL;
   size_t count = 0;
   int fd = -1;
-  if (!load_pair(pack_path, index_path, &entries, &paths, &count, &fd)) return 0;
+  if (!load_pair(pack_path, index_path, client_version, &entries, &paths,
+                 &count, &fd))
+    return 0;
   g_entries = entries;
   g_paths = paths;
   g_entry_count = count;
@@ -432,7 +443,8 @@ static int verify_pack_data(int fd, const DiskEntry *entries, size_t count,
   return checksum == expected;
 }
 
-int asset_pack_build(const char *assets_root, const char *root) {
+int asset_pack_build(const char *assets_root, const char *root,
+                     uint32_t client_version) {
   BuildEntry *items = NULL;
   size_t count = 0, capacity = 0;
   int pack_fd = -1, index_fd = -1, source_fd = -1;
@@ -480,9 +492,15 @@ int asset_pack_build(const char *assets_root, const char *root) {
   pack_id = fnv_bytes(pack_id, &nonce, sizeof nonce);
   if (!pack_id) pack_id = 1;
 
+  if (!client_version) {
+    set_error("The asset pack client version is invalid");
+    goto failed;
+  }
+
   PackHeader pack_header = {0};
   memcpy(pack_header.magic, "GINXPAK1", 8);
   pack_header.version = PACK_VERSION;
+  pack_header.client_version = client_version;
   pack_header.pack_id = pack_id;
   pack_header.file_size = pack_size;
   pack_fd = open(temp_pack, O_WRONLY | O_CREAT | O_TRUNC, 0666);
@@ -561,6 +579,7 @@ int asset_pack_build(const char *assets_root, const char *root) {
   memcpy(index_header.magic, "GINXIDX1", 8);
   index_header.version = PACK_VERSION;
   index_header.count = (uint32_t)count;
+  index_header.client_version = client_version;
   index_header.pack_id = pack_id;
   index_header.pack_size = pack_size;
   index_header.paths_size = paths_size;
@@ -585,7 +604,8 @@ int asset_pack_build(const char *assets_root, const char *root) {
   char *test_paths = NULL;
   size_t test_count = 0;
   int test_fd = -1;
-  if (!load_pair(temp_pack, temp_index, &test_entries, &test_paths, &test_count, &test_fd))
+  if (!load_pair(temp_pack, temp_index, client_version, &test_entries,
+                 &test_paths, &test_count, &test_fd))
     goto failed;
   if (!verify_pack_data(test_fd, test_entries, test_count, data_checksum)) {
     set_error("The written asset data did not pass verification");
@@ -597,7 +617,7 @@ int asset_pack_build(const char *assets_root, const char *root) {
   unlink(pack_path);
   unlink(index_path);
   if (rename(temp_pack, pack_path) != 0 || rename(temp_index, index_path) != 0 ||
-      !asset_pack_open_existing(root)) {
+      !asset_pack_open_existing(root, client_version)) {
     set_error("The validated asset pack could not be installed");
     goto failed;
   }

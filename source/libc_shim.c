@@ -1996,7 +1996,7 @@ extern NxMemoryBackingBackend g_memory_backing_backend;
 #define BIONIC_PROT_READ 0x1
 #define BIONIC_PROT_WRITE 0x2
 
-/* Exact 6.7.0 Unity allocator request: a 4 GiB slab space plus one 8 MiB
+/* Exact 7.0.0 Unity allocator request: a 4 GiB slab space plus one 8 MiB
  * alignment guard.  Android reserves the address range and backs it on first
  * touch.  Keep the same split on Horizon: the whole range is only a libnx
  * virtual reservation, while the exact 8 MiB slab selected by Unity is mapped
@@ -8806,7 +8806,7 @@ int sem_timedwait_fake(void *storage,const struct timespec *absolute){
 }
 
 /* Genshin merges a customized Unity 2017 IL2CPP runtime into libyuanshen.
- * These offsets were derived from the exact supported 6.7.0 image rather than
+ * These offsets were derived from the exact supported 7.0.0 image rather than
  * copied from the Subway/Unity-2022 wrapper.  Its signal-30 handler publishes
  * ucontext+0xb0 and SP into the per-thread record, increments suspend_ack,
  * waits for resume_flag, clears the context pointer, then increments
@@ -8832,18 +8832,17 @@ volatile uint32_t g_gc_bridge_deferred_deliveries;
 volatile uint32_t g_gc_bridge_mutex_dependency_releases;
 volatile uint32_t g_gc_bridge_mutex_release_failures;
 
-#define GI_GC_SIGNAL_RVA       UINT64_C(0x15d9ba78)
-#define GI_GC_SUSPEND_ACK_RVA  UINT64_C(0x15d9ba80)
-#define GI_GC_RESUME_ACK_RVA   UINT64_C(0x15d9ba84)
-#define GI_GC_RESUME_FLAG_RVA  UINT64_C(0x15d9ba88)
-#define GI_GC_THREADS_BEGIN_RVA UINT64_C(0x15d9ba98)
-#define GI_GC_THREADS_END_RVA   UINT64_C(0x15d9baa0)
-/* Pinned 6.7.0 GC service handshake.  RVA 0x044b1d84 posts work through
- * request/completion at 0x15f9c570/574; the sole completion producer is the
- * pthread entry at 0x044ba124. */
-#define GI_GC_WORKER_ENTRY_RVA UINT64_C(0x044ba124)
-#define GI_GC_REQUEST_RVA      UINT64_C(0x15f9c570)
-#define GI_GC_COMPLETION_RVA   UINT64_C(0x15f9c574)
+#define GI_GC_SIGNAL_RVA       UINT64_C(0x14df3230)
+#define GI_GC_SUSPEND_ACK_RVA  UINT64_C(0x14df3238)
+#define GI_GC_RESUME_ACK_RVA   UINT64_C(0x14df323c)
+#define GI_GC_RESUME_FLAG_RVA  UINT64_C(0x14df3240)
+#define GI_GC_THREADS_BEGIN_RVA UINT64_C(0x14df3250)
+#define GI_GC_THREADS_END_RVA   UINT64_C(0x14df3258)
+/* Pinned 7.0.0 GC service handshake.  RVA 0x044c304c posts work through
+ * request/completion at 0x14ff3c48/4c; the worker entry is 0x044caaa4. */
+#define GI_GC_WORKER_ENTRY_RVA UINT64_C(0x044caaa4)
+#define GI_GC_REQUEST_RVA      UINT64_C(0x14ff3c48)
+#define GI_GC_COMPLETION_RVA   UINT64_C(0x14ff3c4c)
 #define GI_GC_RECORD_CONTEXT_OFF 8u
 #define GI_GC_RECORD_SP_OFF      32u
 #define GI_GC_RECORD_ACTIVE_OFF  72u
@@ -8864,8 +8863,8 @@ volatile uint32_t g_gc_bridge_mutex_release_failures;
 #define GI_GC_UC_PC_OFF          0x1b8u
 #define GI_GC_UC_PSTATE_OFF      0x1c0u
 
-/* The pinned client's conservative stack scanner at RVA 0x044af518 queues
- * exactly 0x1120 bytes starting at record->context.  That is Android arm64's
+/* Analysis of the 6.7.0 client's conservative stack scanner established that
+ * it queues exactly 0x1120 bytes starting at record->context.  That is Android arm64's
  * complete mcontext_t (including its 4 KiB reserved extension area), not only
  * the integer-register prefix.  Keeping a short 512-byte ucontext made every
  * collection scan about 4 KiB beyond each slot into the next suspension and

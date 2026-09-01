@@ -22,7 +22,7 @@
 #define ANDROID_ID_PATH IDENTITY_DIR "/android_id"
 #define ANDROID_ID_TEMP_PATH IDENTITY_DIR "/.android_id.tmp"
 
-/* SHA-256 of the sole v2/v3 signer certificate in the exact 6.7.0 base APK.
+/* SHA-256 of the sole v2/v3 signer certificate in the supported base APK.
  * Subject/issuer: CN=Android, OU=Android, O=Google Inc., L=Mountain View,
  * S=California, C=US. */
 static const uint8_t exact_signer_sha256[32] = {
