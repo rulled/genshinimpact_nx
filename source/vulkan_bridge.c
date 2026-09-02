@@ -208,7 +208,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL nx_vkQueueSubmit(
   VkResult result = submit(queue, submit_count, submits, fence);
   int n = __atomic_add_fetch(&g_submit_count, 1, __ATOMIC_SEQ_CST);
   if (result != VK_SUCCESS) {
-    int fn = __atomic_add_fetch(&g_submit_fail_count, 1, __ATOMIC_SEQ_CUST);
+    int fn = __atomic_add_fetch(&g_submit_fail_count, 1, __ATOMIC_SEQ_CST);
     FILE *f = fopen(GAME_HOME "/run_log.txt", "ab");
     if (f && fn <= 30) {
       fprintf(f, "[E] vkQueueSubmit FAIL #%d result=%d (total calls=%d)\n",
