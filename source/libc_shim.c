@@ -3696,18 +3696,33 @@ void nx_sparse_arena_get_diagnostics(NxSparseArenaDiagnostics *out) {
 
   if (oc_dynamic_metadata_ready &&
       !mutexIsLockedByCurrentThread(&g_mmap_lock)) {
-    mmap_broker_lock();
-    uint64_t free_pages = 0;
-    uint64_t largest_pages = 0;
-    for (uint32_t node = oc_dynamic_extent_head; node;
-         node = oc_dynamic_extents[node].next) {
-      free_pages += oc_dynamic_extents[node].pages;
-      if (oc_dynamic_extents[node].pages > largest_pages)
-        largest_pages = oc_dynamic_extents[node].pages;
+    /* Heartbeat diagnostics must never block.  mmap_broker_lock() is a
+     * spin-loop (mutexTryLock + svcSleepThread(0)); if the holder of
+     * g_mmap_lock is wedged in a kernel SVC (the verification hang), the
+     * heartbeat thread would spin here forever, truncating the run log
+     * mid-heartbeat and hiding the very contention we need to see.  Use a
+     * one-shot try-lock: if the broker is busy, skip the free-list scan
+     * (pool_free_bytes stays 0) and let the caller record that the snapshot
+     * was deferred. */
+    nx_guest_gc_critical_enter();
+    const int locked = mutexTryLock(&g_mmap_lock);
+    nx_guest_gc_critical_leave();
+    if (locked) {
+      uint64_t free_pages = 0;
+      uint64_t largest_pages = 0;
+      for (uint32_t node = oc_dynamic_extent_head; node;
+           node = oc_dynamic_extents[node].next) {
+        free_pages += oc_dynamic_extents[node].pages;
+        if (oc_dynamic_extents[node].pages > largest_pages)
+          largest_pages = oc_dynamic_extents[node].pages;
+      }
+      mmap_broker_unlock();
+      out->pool_free_bytes = free_pages * MMAP_PAGE;
+      out->pool_largest_free_bytes = largest_pages * MMAP_PAGE;
+    } else {
+      out->pool_free_bytes = UINT64_MAX;  /* sentinel: broker busy */
+      out->pool_largest_free_bytes = UINT64_MAX;
     }
-    mmap_broker_unlock();
-    out->pool_free_bytes = free_pages * MMAP_PAGE;
-    out->pool_largest_free_bytes = largest_pages * MMAP_PAGE;
   }
 }
 

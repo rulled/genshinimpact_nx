@@ -2670,6 +2670,35 @@ int main(int argc, char **argv) {
                 (unsigned long long)net.tracked_datagram_sockets,
                 (unsigned long long)net.largest_datagram_received_bytes);
         (void)KiB;
+        /* Donor headroom + file-IO trim-stall telemetry.  During the download
+         * verification phase (~50GB of .blk hashed at once) the heap-donor pool
+         * approaches its ceiling and finalize_fd fsFileSetSize IPCs can stall.
+         * headroom = donor_capacity - donor_active; when it nears zero the
+         * next file-backed mmap can trip svcSetHeapSize under memory pressure
+         * and wedge the system.  fio_active/oldest_ms expose a stuck trim:
+         * oldest_ms climbing across heartbeats = a finalize_fd IPC not
+         * returning.  pool_free=UINT64_MAX is the "broker busy" sentinel set
+         * when g_mmap_lock could not be try-locked (the hang signature). */
+        NxFileIoDiagnostics fio = {0};
+        nx_file_io_get_diagnostics(&fio);
+        const unsigned long long donor_cap = diag.donor_capacity_bytes / MiB;
+        const unsigned long long donor_head =
+          (diag.donor_capacity_bytes > diag.donor_active_bytes)
+            ? (diag.donor_capacity_bytes - diag.donor_active_bytes) / MiB
+            : 0;
+        const unsigned long long pool_free = diag.pool_free_bytes;
+        fprintf(lf,
+                "[I] mem: cap=%lluM head=%lluM pool_free=%lluB "
+                "fio_active=%llu oldest=%llums slot=%u kind=%u fin=%llu/%llu\n",
+                donor_cap, donor_head,
+                (pool_free == UINT64_MAX) ? UINT64_MAX : pool_free,
+                (unsigned long long)fio.size_operations_active,
+                (unsigned long long)fio.oldest_size_operation_ms,
+                (fio.oldest_size_operation_slot == UINT32_MAX)
+                  ? 0u : fio.oldest_size_operation_slot,
+                fio.oldest_size_operation_kind,
+                (unsigned long long)fio.finalize_calls,
+                (unsigned long long)fio.finalize_failures);
         fclose(lf);
       }
     }

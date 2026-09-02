@@ -1052,27 +1052,40 @@ void nx_file_io_finalize_fd(int fd) {
     return;
   }
   mutexLock(&entry->lock);
+  /* Capture the trim decision, then retire the slot, all under the per-entry
+   * lock.  Releasing the global registry lock BEFORE the trim IPC is the fix
+   * for the verification hang: g_file_size_registry_lock serializes every
+   * read/write/stat in the process, so holding it across the fsFileSetSize
+   * FS IPC wedged all I/O when the trim stalled while ~1100 downloaded files
+   * were closed at once.  Mirrors nx_file_io_prepare_write, which likewise
+   * drops the registry lock before fsFileSetSize.  The per-entry lock stays
+   * held across the IPC: the slot is already marked unused (used=0), so no
+   * opener can reacquire it, and the fd is mid-close so no other operation
+   * races on this entry. */
+  const int do_trim =
+    entry->initialized && entry->physical_size > entry->logical_size;
+  const int64_t trim_logical = entry->logical_size;
+  const uint64_t trimmed = do_trim
+    ? (uint64_t)(entry->physical_size - entry->logical_size) : 0;
   entry->used = 0;
   entry->file = NULL;
-  if (entry->initialized && entry->physical_size > entry->logical_size) {
+  entry->initialized = 0;
+  entry->bulk_eligible = 0;
+  entry->path[0] = '\0';
+  mutexUnlock(&g_file_size_registry_lock);
+  if (do_trim) {
     FILE_IO_ADD(finalize_calls, 1);
-    const uint64_t trimmed =
-      (uint64_t)(entry->physical_size - entry->logical_size);
     nx_file_size_operation_begin(entry, NX_FILE_SIZE_OP_FINALIZE);
-    const Result resize_result = fsFileSetSize(&file->file, entry->logical_size);
+    const Result resize_result = fsFileSetSize(&file->file, trim_logical);
     nx_file_size_operation_end(entry);
     if (R_FAILED(resize_result)) {
       FILE_IO_ADD(finalize_failures, 1);
     } else {
       FILE_IO_ADD(finalized_bytes, trimmed);
-      entry->physical_size = entry->logical_size;
+      entry->physical_size = trim_logical;
     }
   }
-  entry->initialized = 0;
-  entry->bulk_eligible = 0;
-  entry->path[0] = '\0';
   mutexUnlock(&entry->lock);
-  mutexUnlock(&g_file_size_registry_lock);
   errno = saved_errno;
 }
 
