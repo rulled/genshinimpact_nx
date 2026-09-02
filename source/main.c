@@ -2615,6 +2615,8 @@ int main(int argc, char **argv) {
     if (frame_count % 120 == 0) {
       NxSparseArenaDiagnostics diag = {0};
       nx_sparse_arena_get_diagnostics(&diag);
+      NetworkTransportDiagnostics net = {0};
+      network_get_transport_diagnostics(&net);
       FILE *lf = fopen(DATA_ROOT "/run_log.txt", "ab");
       if (lf) {
         const unsigned long long MiB = 1024ull * 1024ull;
@@ -2629,6 +2631,27 @@ int main(int argc, char **argv) {
                 diag.dynamic_mapped_bytes / MiB,
                 (unsigned long long)diag.backing_unmap_ok,
                 (unsigned long long)diag.backing_unmap_fail);
+        /* Network transport telemetry.  received_bytes/recv_calls expose
+         * throughput; long_stream_window_* show whether the SO_RCVBUF
+         * promotion fired and what effective window each bulk stream got.
+         * Without this the ~350 kbit/s download cap was unobservable. */
+        const unsigned long long KiB = 1024ull;
+        fprintf(lf,
+                "[I] net: recv=%lluB/%llu rxfail=%llu wblock=%llu "
+                "rcvbuf win att=%llu ok=%llu fail=%llu eff=%lluB "
+                "largest=%lluB streams=%llu/%llu\n",
+                (unsigned long long)net.received_bytes,
+                (unsigned long long)net.recv_calls,
+                (unsigned long long)net.recv_failures,
+                (unsigned long long)net.recv_would_block,
+                (unsigned long long)net.long_stream_window_attempts,
+                (unsigned long long)net.long_stream_window_successes,
+                (unsigned long long)net.long_stream_window_failures,
+                (unsigned long long)net.last_long_stream_window_effective,
+                (unsigned long long)net.largest_stream_received_bytes,
+                (unsigned long long)net.receiving_stream_sockets,
+                (unsigned long long)net.tracked_stream_sockets);
+        (void)KiB;
         fclose(lf);
       }
     }

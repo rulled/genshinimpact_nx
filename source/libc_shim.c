@@ -7631,6 +7631,27 @@ int setsockopt_fake(int s, int lv, int n, const void *v, unsigned l) {
     v = &dontfrag;
     l = sizeof dontfrag;
   }
+  /* Floor-clamp SO_RCVBUF so the guest cannot shrink the TCP receive window
+   * below the promoted long-stream target.  The one-shot promotion in
+   * network_maybe_promote_receive_window never re-fires, so a later
+   * setsockopt(SO_RCVBUF, small) from the game would collapse the window
+   * and cap bulk-download throughput (observed ~350 kbit/s).  When the
+   * configured target is 0 (no promotion configured / control traffic),
+   * this is a no-op and the guest's value passes through unchanged. */
+  int rcvbuf_floor_value = 0;
+  if (L == SOL_SOCKET && N == SO_RCVBUF && v && l >= sizeof(int)) {
+    const uint32_t target = __atomic_load_n(
+      &g_network_long_stream_receive_window, __ATOMIC_RELAXED);
+    if (target > 0 && target <= (uint32_t)INT_MAX) {
+      int requested = *(const int *)v;
+      if ((uint32_t)requested < target) {
+        rcvbuf_floor_value = (int)target;
+        v = &rcvbuf_floor_value;
+        l = sizeof rcvbuf_floor_value;
+        NET_DIAG_ADD(long_stream_window_attempts, 1);
+      }
+    }
+  }
   int r = setsockopt(s, L, N, v, l); if (r < 0) NET_FAIL(); return r;
 }
 int getsockopt_fake(int s, int lv, int n, void *v, void *l) {

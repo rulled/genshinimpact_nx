@@ -38,11 +38,17 @@ static int g_imgmemreq_count;
 static int g_bind_fail_count;
 static int g_submit_count;
 static int g_submit_fail_count;
+static int g_throttle_drains;
 static int g_present_count;
 static int g_present_fail_count;
 static int g_acquire_count;
 static int g_acquire_fail_count;
 static int g_alloc_large_count;
+
+/* Drain the GPU queue every N successful vkQueueSubmit calls to prevent the
+ * download-burst command-buffer pile-up that caused VK_ERROR_DEVICE_LOST on
+ * submit #1001 on NVK 25.0.7.  See the fence-throttle block in nx_vkQueueSubmit. */
+#define NX_VK_THROTTLE_PERIOD 256
 
 static void log_image_failure(VkResult result, const VkImageCreateInfo *ci) {
   int n = __atomic_add_fetch(&g_img_fail_count, 1, __ATOMIC_SEQ_CST);
@@ -202,13 +208,38 @@ static VKAPI_ATTR VkResult VKAPI_CALL nx_vkQueueSubmit(
   VkResult result = submit(queue, submit_count, submits, fence);
   int n = __atomic_add_fetch(&g_submit_count, 1, __ATOMIC_SEQ_CST);
   if (result != VK_SUCCESS) {
-    int fn = __atomic_add_fetch(&g_submit_fail_count, 1, __ATOMIC_SEQ_CST);
+    int fn = __atomic_add_fetch(&g_submit_fail_count, 1, __ATOMIC_SEQ_CUST);
     FILE *f = fopen(GAME_HOME "/run_log.txt", "ab");
     if (f && fn <= 30) {
       fprintf(f, "[E] vkQueueSubmit FAIL #%d result=%d (total calls=%d)\n",
               fn, (int)result, n);
       fflush(f);
       fclose(f);
+    }
+  }
+  /* Fence-throttle: drain the GPU queue every NX_VK_THROTTLE_PERIOD submits.
+   * The resource-download path bursts many heavy command buffers at once; on
+   * NVK 25.0.7 one such burst overran the nvhost channel and returned
+   * VK_ERROR_DEVICE_LOST on submit #1001 (push_sync, which serializes every
+   * submit, confirmed this and fixed it -- but at a heavy framerate cost).
+   * A periodic vkQueueWaitIdle gives the channel a completion point mid-burst
+   * so it never backs up past the watchdog, without serializing every submit.
+   * This is the productionizable form of the push_sync mitigation. */
+  if (result == VK_SUCCESS && (n % NX_VK_THROTTLE_PERIOD) == 0) {
+    PFN_vkQueueWaitIdle wait_idle =
+      (PFN_vkQueueWaitIdle)driver_proc(inst, "vkQueueWaitIdle");
+    if (wait_idle) {
+      const VkResult drain = wait_idle(queue);
+      int dn = __atomic_add_fetch(&g_throttle_drains, 1, __ATOMIC_SEQ_CST);
+      if (drain != VK_SUCCESS) {
+        FILE *f = fopen(GAME_HOME "/run_log.txt", "ab");
+        if (f && dn <= 30) {
+          fprintf(f, "[E] vkQueueWaitIdle(throttle) #%d result=%d (at submit=%d)\n",
+                  dn, (int)drain, n);
+          fflush(f);
+          fclose(f);
+        }
+      }
     }
   }
   return result;
