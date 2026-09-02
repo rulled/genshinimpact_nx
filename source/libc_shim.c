@@ -5919,6 +5919,14 @@ int network_get_transport_diagnostics(NetworkTransportDiagnostics *out) {
   out->stalled_queued_last_poll_tick_ns = 0;
   out->stalled_queued_recv_thread = 0;
   out->stalled_queued_poll_thread = 0;
+  out->udp_recv_calls = 0;
+  out->udp_received_bytes = 0;
+  out->udp_send_calls = 0;
+  out->udp_sent_bytes = 0;
+  out->udp_receive_errors = 0;
+  out->tracked_datagram_sockets = 0;
+  out->largest_datagram_received_bytes = 0;
+  out->last_udp_receive_tick_ns = 0;
   const uint64_t now_ns = armTicksToNs(armGetSystemTick());
   for (unsigned fd = 0; fd < NETWORK_TRACKED_FD_LIMIT; ++fd) {
     NetworkSocketProgress *progress = &g_network_socket_progress[fd];
@@ -5985,6 +5993,36 @@ int network_get_transport_diagnostics(NetworkTransportDiagnostics *out) {
         }
       }
     }
+  }
+
+  /* Aggregate UDP/KCP sockets separately.  Genshin's bulk resource download
+   * runs over KCP (reliable UDP via recvmsg/recvfrom), so without this pass
+   * the download throughput is invisible — the TCP counters above freeze at
+   * the control-traffic total while gigabytes flow here. */
+  for (unsigned fd = 0; fd < NETWORK_TRACKED_FD_LIMIT; ++fd) {
+    NetworkSocketProgress *progress = &g_network_socket_progress[fd];
+    if (!__atomic_load_n(&progress->active, __ATOMIC_ACQUIRE) ||
+        !__atomic_load_n(&progress->datagram, __ATOMIC_RELAXED))
+      continue;
+    ++out->tracked_datagram_sockets;
+    out->udp_recv_calls += __atomic_load_n(&progress->udp_receive_calls,
+                                           __ATOMIC_RELAXED);
+    out->udp_received_bytes += __atomic_load_n(&progress->udp_received_bytes,
+                                               __ATOMIC_RELAXED);
+    out->udp_send_calls += __atomic_load_n(&progress->udp_send_calls,
+                                           __ATOMIC_RELAXED);
+    out->udp_sent_bytes += __atomic_load_n(&progress->udp_sent_bytes,
+                                           __ATOMIC_RELAXED);
+    out->udp_receive_errors += __atomic_load_n(&progress->udp_receive_errors,
+                                               __ATOMIC_RELAXED);
+    const uint64_t dbytes = __atomic_load_n(&progress->udp_received_bytes,
+                                           __ATOMIC_RELAXED);
+    if (dbytes > out->largest_datagram_received_bytes)
+      out->largest_datagram_received_bytes = dbytes;
+    const uint64_t dlast = __atomic_load_n(&progress->last_receive_tick_ns,
+                                           __ATOMIC_RELAXED);
+    if (dlast > out->last_udp_receive_tick_ns)
+      out->last_udp_receive_tick_ns = dlast;
   }
 
   NxEpollDiagnostics epoll;

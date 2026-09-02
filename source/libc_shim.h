@@ -473,6 +473,18 @@ typedef struct {
   uint64_t stalled_queued_last_poll_tick_ns;
   uintptr_t stalled_queued_recv_thread;
   uintptr_t stalled_queued_poll_thread;
+  /* UDP/KCP transport.  Genshin's bulk resource download runs over KCP
+   * (reliable UDP via recvmsg/recvfrom), NOT TCP, so the TCP receive-window
+   * telemetry above stays frozen while gigabytes flow here.  These aggregate
+   * the per-socket udp_* counters so the download throughput is observable. */
+  uint64_t udp_recv_calls;
+  uint64_t udp_received_bytes;
+  uint64_t udp_send_calls;
+  uint64_t udp_sent_bytes;
+  uint64_t udp_receive_errors;
+  uint64_t tracked_datagram_sockets;
+  uint64_t largest_datagram_received_bytes;
+  uint64_t last_udp_receive_tick_ns;
 } NetworkTransportDiagnostics;
 
 int network_get_transport_diagnostics(NetworkTransportDiagnostics *out);

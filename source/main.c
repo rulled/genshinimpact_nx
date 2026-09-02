@@ -2651,6 +2651,24 @@ int main(int argc, char **argv) {
                 (unsigned long long)net.largest_stream_received_bytes,
                 (unsigned long long)net.receiving_stream_sockets,
                 (unsigned long long)net.tracked_stream_sockets);
+        /* UDP/KCP transport telemetry.  Genshin's bulk resource download runs
+         * over KCP (reliable UDP via recvmsg/recvfrom), so the TCP line above
+         * freezes at the control-traffic total while gigabytes flow here.
+         * Diff udp_recv_bytes between two consecutive heartbeat lines (120
+         * frames apart) for actual download throughput.  udp_receive_errors
+         * rising against udp_recv_calls indicates packet loss / KCP
+         * retransmit pressure, which is a candidate root of the ~350 kbit/s
+         * cap. */
+        fprintf(lf,
+                "[I] net-udp: recv=%lluB/%llu sent=%lluB/%llu "
+                "rxfail=%llu dgram=%llu largest=%lluB\n",
+                (unsigned long long)net.udp_received_bytes,
+                (unsigned long long)net.udp_recv_calls,
+                (unsigned long long)net.udp_sent_bytes,
+                (unsigned long long)net.udp_send_calls,
+                (unsigned long long)net.udp_receive_errors,
+                (unsigned long long)net.tracked_datagram_sockets,
+                (unsigned long long)net.largest_datagram_received_bytes);
         (void)KiB;
         fclose(lf);
       }
