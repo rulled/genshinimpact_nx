@@ -1,4 +1,4 @@
-/* Genshin Impact 7.0.0 Android/Unity host for Nintendo Switch (libnx). */
+/* Genshin Impact 7.0.1 Android/Unity host for Nintendo Switch (libnx). */
 
 #include <switch.h>
 #include <SDL2/SDL.h>
@@ -663,10 +663,10 @@ static void check_data(void) {
 
 static int exact_game_library_hash(void) {
   static const uint8_t expected[SHA256_HASH_SIZE] = {
-    0x26,0xc8,0x62,0xb1,0x47,0xd2,0x82,0x2a,
-    0x39,0xe5,0x46,0x4e,0x76,0x16,0x11,0x76,
-    0x7a,0xba,0xec,0x1a,0x54,0x16,0x98,0xac,
-    0x53,0xf8,0x0c,0x13,0x5a,0x9a,0x42,0xd1,
+    0x09,0xb2,0xd7,0x59,0x3c,0xe4,0x8e,0xa3,
+    0x0b,0xbd,0xad,0x66,0x98,0x3a,0x20,0x76,
+    0x72,0xf2,0x55,0xdd,0x5c,0x47,0x7b,0xc6,
+    0x4b,0x27,0xd9,0x80,0xdc,0x46,0x0e,0xec,
   };
   uint8_t *buffer = malloc(1024 * 1024);
   FILE *file = fopen(LIB_GAME, "rb");
@@ -745,7 +745,7 @@ static void prepare_game_data(void) {
   startup_status_update("Verifying the extracted Android client");
   if (!exact_game_library_hash())
     fatal_error("Unsupported libyuanshen.so. This wrapper requires SHA-256:\n%s",
-                "26c862b147d2822a39e5464e761611767abaec1a541698ac53f80c135a9a42d1");
+                "09b2d7593ce48ea30bbdad66983a207672f255dd5c477bc64b27d980dc460eec");
 
   if (!existing_pack) {
     if (!asset_pack_build(DATA_ROOT "/assets", DATA_ROOT, SS_VERSION_CODE))
@@ -1299,7 +1299,7 @@ static int module_contains_string(const char *p) {
  * loader.  A raw JNI FindClass is the equivalent lookup in this no-ART
  * wrapper, but AndroidJavaClass stores its result in m_jclass (+0x18) while
  * the two native consumers read AndroidJavaObject.m_jobject (+0x10), so the
- * consumer at RVA 0x14196EFC would otherwise see null.
+ * class consumer would otherwise see null.
  *
  * Swap '/'->'.' to '.'->'/', call AndroidJNISafe.FindClass, construct the
  * client's AndroidJavaClass(IntPtr), and change only the two fingerprinted
@@ -1328,28 +1328,28 @@ static void patch_unity_java_class_resolution(void) {
   static const uint32_t expected_generic[] = {
     UINT32_C(0xb40001e0), UINT32_C(0xf9400288),
     UINT32_C(0xb940b108), UINT32_C(0x340003a8),
-    UINT32_C(0x90017e69), UINT32_C(0xf941d529),
+    UINT32_C(0x90017c09), UINT32_C(0xf9463529),
     UINT32_C(0xf9400129), UINT32_C(0x8b080128),
     UINT32_C(0xf9400001), UINT32_C(0xaa0003f5),
-    UINT32_C(0xaa0803e0), UINT32_C(0x9767b7a9),
+    UINT32_C(0xaa0803e0), UINT32_C(0x97668706),
     UINT32_C(0x2a0003e8), UINT32_C(0xaa1503e0),
     UINT32_C(0x360003c8), UINT32_C(0xb9401a88),
     UINT32_C(0x34000288), UINT32_C(0xf9001280),
   };
   static const uint32_t patched_generic[] = {
-    UINT32_C(0xb4000420), /* null string -> existing exception path */
+    UINT32_C(0xb4000440), /* null string -> existing exception path */
     UINT32_C(0xaa1503e0), /* mov x0, x21 */
-    UINT32_C(0x9767f134), /* bl AndroidJNISafe.FindClass veneer, RVA 0x0F823298 */
-    UINT32_C(0xb40003c0), /* null jclass -> existing exception path */
+    UINT32_C(0x9766c128), /* bl AndroidJNISafe.FindClass veneer, RVA 0x0F823480 */
+    UINT32_C(0xb40003e0), /* null jclass -> existing exception path */
     UINT32_C(0xaa0003f4), /* mov x20, x0 (owned local jclass) */
-    UINT32_C(0xd0016608), /* adrp x8, AndroidJavaClass metadata page */
-    UINT32_C(0xf943d508), /* ldr x8, [x8, #0x7a8] */
+    UINT32_C(0xf00163a8), /* adrp x8, AndroidJavaClass metadata page */
+    UINT32_C(0xf9403508), /* ldr x8, [x8, #0x68] */
     UINT32_C(0xaa0803e0), /* mov x0, x8 */
-    UINT32_C(0x9767b7b2), /* bl il2cpp_object_new, RVA 0x0F814CA8 */
+    UINT32_C(0x9766870f), /* bl il2cpp_object_new, RVA 0x0F814C34 */
     UINT32_C(0xb4000320), /* allocation failure -> existing exception path */
     UINT32_C(0xaa0003f3), /* mov x19, x0 */
     UINT32_C(0xaa1403e1), /* mov x1, x20 */
-    UINT32_C(0x97580e92), /* bl AndroidJavaClass(IntPtr), RVA 0x0F42A838 */
+    UINT32_C(0x9756dcf7), /* bl AndroidJavaClass(IntPtr), RVA 0x0F42A3E4 */
     UINT32_C(0xaa1303e0), /* mov x0, x19 */
     UINT32_C(0xa9424ff4), /* ldp x20, x19, [sp, #32] */
     UINT32_C(0xa94157f6), /* ldp x22, x21, [sp, #16] */
@@ -1363,10 +1363,10 @@ static void patch_unity_java_class_resolution(void) {
   _Static_assert(sizeof(expected_generic) == sizeof(patched_generic),
                  "Java class resolver patch size changed");
   _Static_assert((GENSHIN_JAVA_CLASS_GENERIC_CALL_RVA + 8u * 4u) -
-                   GENSHIN_IL2CPP_OBJECT_NEW_RVA == UINT64_C(0x2612138),
+                    GENSHIN_IL2CPP_OBJECT_NEW_RVA == UINT64_C(0x265e3c4),
                  "il2cpp_object_new branch displacement changed");
   _Static_assert((GENSHIN_JAVA_CLASS_GENERIC_CALL_RVA + 12u * 4u) -
-                   GENSHIN_ANDROIDJAVACLASS_CTOR_RVA == UINT64_C(0x29fc5b8),
+                    GENSHIN_ANDROIDJAVACLASS_CTOR_RVA == UINT64_C(0x2a48c24),
                  "AndroidJavaClass constructor branch displacement changed");
 
   if (!module_contains(replace_chars, sizeof(expected_replace)) ||
@@ -1401,9 +1401,9 @@ static void patch_unity_slab_activation(void) {
     (uintptr_t)game_mod.load_virtbase +
     GENSHIN_UNITY_SLAB_ACTIVATE_SEQUENCE_RVA);
   static const uint32_t expected[] = {
-    UINT32_C(0xd0085968), /* adrp x8, aligned slab global */
+    UINT32_C(0xb0085988), /* adrp x8, aligned slab global */
     UINT32_C(0x92403ee9), /* and x9, x23, #0xffff */
-    UINT32_C(0xf947c908), /* ldr x8, [x8, #0xf90] */
+    UINT32_C(0xf9442908), /* ldr x8, [x8, #0x850] */
     UINT32_C(0xab095d1a), /* adds x26, x8, x9, lsl #23 */
   };
   struct {
@@ -1431,7 +1431,7 @@ static void patch_unity_slab_activation(void) {
     fatal_error("Could not install the Unity slab on-demand commit bridge.");
 }
 
-/* 1224 inlined il2cpp_string_new_len, so the NRO reimplements it via the
+/* 1234 inlined il2cpp_string_new_len, so the NRO reimplements it via the
  * game's own GC helpers (see genshin_il2cpp_string_new_len). */
 typedef void *(*GenshinIl2CppTypeResolverFn)(void *type_ptr);
 typedef void *(*GenshinIl2CppSizedAllocFn)(void *klass, uint32_t size,
@@ -1465,7 +1465,7 @@ static int managed_path_to_ascii(const void *object, char *output,
   return 1;
 }
 
-/* Reproduce the exact managed sequence replaced at RVA 0xC684DD4.  Only its
+/* Reproduce the exact managed sequence replaced at RVA 0xC68421C.  Only its
  * application-path input is normalized; the original Unity getter and both
  * original System.IO.Path implementations still execute.  Keeping this at the
  * Mmoron call site avoids changing exception/unwind behavior for any unrelated
@@ -1529,10 +1529,10 @@ static void patch_mmoron_managed_directory_path(void) {
     (uintptr_t)game_mod.load_virtbase +
     GENSHIN_MMORON_DIRECTORY_SEQUENCE_RVA);
   static const uint32_t expected[] = {
-    UINT32_C(0x94b69a7c), /* bl Unity application-path getter thunk */
-    UINT32_C(0x9777f80f), /* bl Path.GetDirectoryName */
+    UINT32_C(0x94b69c55), /* bl Unity application-path getter thunk */
+    UINT32_C(0x9777f475), /* bl Path.GetDirectoryName */
     UINT32_C(0xf9404e81), /* ldr x1, [x20, #0x98] */
-    UINT32_C(0x9777f659), /* bl Path.Combine */
+    UINT32_C(0x9777f2bf), /* bl Path.Combine */
   };
   struct {
     uint32_t ldr_x16_literal;
@@ -1570,14 +1570,14 @@ static int readable_object_span(const void *object, size_t bytes) {
   return 1;
 }
 
-/* Reimplemented il2cpp_string_new_len for the 1224 client.  The original
+/* Reimplemented il2cpp_string_new_len for the 1234 client.  The original
  * helper was inlined by the compiler (no callable (char*,len)->Il2CppString*
  * exists in the RX segment), so the legacy GENSHIN_IL2CPP_STRING_NEW_LEN_RVA
  * cannot be used.  This replicates the game's own Il2CppString construction at
- * RVA 0x79b9814 via its native GC helpers:
- *   1. load the Il2CppString alloc-vtable from the GC slab (page + 0x700);
- *   2. resolve the type holder (0x782A890) and read [holder] for the class;
- *   3. sized-allocate (0x4128E94) with size = len*2 + 0x14 + 0x2;
+ * RVA 0x79b7c68 via its native GC helpers:
+ *   1. load the Il2CppString alloc-vtable from the GC slab (page + 0xfc0);
+ *   2. resolve the type holder (0x7828d50) and read [holder] for the class;
+ *   3. sized-allocate (0x4126f54) with size = len*2 + 0x14 + 0x2;
  *   4. store the int32 length @ +0x10 and zero-extend ASCII to UTF-16 @ +0x14.
  * Returns a GC-managed Il2CppString* or NULL when the GC slab/type is not yet
  * initialized (callers treat NULL as a repair failure). */
@@ -1641,7 +1641,7 @@ static int writable_object_span(const void *object, size_t bytes) {
 
 typedef void (*GenshinTransferRefillFn)(void *, void *, uint32_t);
 
-/* Replacement for the exact leaf callback at RVA 0x5130DAC.  For ordinary
+/* Replacement for the exact 1234 leaf callback.  For ordinary
  * mapped destinations this is instruction-for-instruction equivalent at the
  * data-structure level: select the transfer cursor, copy four bytes, and
  * advance it (or enter the client's refill path).  Hardware instead reached
@@ -1779,8 +1779,8 @@ static int managed_string_equals(const void *object, const char *ascii,
 
 /* The class-name slot is already non-null after the first render, so pointer
  * presence alone is not a useful invariant.  The exact Unity 2017 helper at
- * RVA 0x141BED68 loads the forName method-name literal from RVA 0x15CBFF08
- * before entering JNI.  Verify both IL2CPP String objects and repair only a
+ * helper loads the forName method-name literal before entering JNI.  Verify
+ * both IL2CPP String objects and repair only a
  * null or non-matching value. */
 static void repair_combo_managed_class_name(void) {
   const uintptr_t module_base = (uintptr_t)game_mod.load_virtbase;
@@ -1798,7 +1798,7 @@ static void repair_combo_managed_class_name(void) {
     (void **)(module_base + GENSHIN_JAVA_FOR_NAME_SLOT_RVA);
   void *const *const empty_args_slot =
     (void *const *)(module_base + GENSHIN_EMPTY_OBJECT_ARGS_SLOT_RVA);
-  /* 1224 inlined il2cpp_string_new_len, so the legacy
+  /* 1234 inlined il2cpp_string_new_len, so the legacy
    * GENSHIN_IL2CPP_STRING_NEW_LEN_RVA is not a callable helper.  The repair
    * fallback below uses genshin_il2cpp_string_new_len (which drives the game's
    * own GC helpers); verify those RVAs land in the exact client image. */
@@ -1916,7 +1916,7 @@ static void validate_unity_slab_client_state(const void *reservation,
  * segment, so Android relocations do not rewrite them. */
 #define GENSHIN_EXACT_LOAD_SIZE ((size_t)UINT64_C(0x15240000))
 #define GENSHIN_EXACT_SHA256 \
-  "26c862b147d2822a39e5464e761611767abaec1a541698ac53f80c135a9a42d1"
+  "09b2d7593ce48ea30bbdad66983a207672f255dd5c477bc64b27d980dc460eec"
 
 typedef struct {
   uintptr_t rva;
@@ -1925,33 +1925,21 @@ typedef struct {
 
 static int supported_game_image(void) {
   static const GameFingerprint fingerprints[] = {
-    /* FP1: GC-signal gate.  1206 adrp x8,#0x15d9b000; ldr w8,[x8,#0xa78]
-     * -> 1224 adrp x8,#0x14df3000; ldr w8,[x8,#0x230] (page + offset both
-     * relocated; the str x30/stp x20,x19 prologue is unchanged). */
-    { UINT64_C(0x044ca4e0),
+    /* FP1: 1234 GC-signal gate and unchanged function prologue. */
+    { UINT64_C(0x044c83d0),
       { 0xfe, 0x0f, 0x1e, 0xf8, 0xf4, 0x4f, 0x01, 0xa9,
-        0x48, 0x49, 0x08, 0xb0, 0x08, 0x31, 0x42, 0xb9 } },
-    /* FP2/FP3: retry loops that BL the same PLT thunk (1206 0x72dcad4 ->
-     * 1224 0x7856f78; 6 callers in both).  The cbz w0; str wzr; b loop was
-     * reorganized to cbnz w0; add; add, and the GC metadata field moved from
-     * ldr w1,[xN,#0xa78] to ldr w1,[xN,#0x230]. */
-    { UINT64_C(0x044c00d4),
-      { 0xa9, 0x5b, 0xce, 0x94, 0xc0, 0x00, 0x00, 0x35,
+        0x48, 0x49, 0x08, 0xf0, 0x08, 0xf1, 0x4a, 0xb9 } },
+    /* FP2/FP3: 1234 retry loops that BL the same PLT thunk. */
+    { UINT64_C(0x044bdfc4),
+      { 0x1d, 0x5d, 0xce, 0x94, 0xc0, 0x00, 0x00, 0x35,
         0xd6, 0x06, 0x00, 0x91, 0x18, 0x23, 0x00, 0x91 } },
-    { UINT64_C(0x044c53b4),
-      { 0xf1, 0x46, 0xce, 0x94, 0xc0, 0x00, 0x00, 0x35,
+    { UINT64_C(0x044c32a4),
+      { 0x65, 0x48, 0xce, 0x94, 0xc0, 0x00, 0x00, 0x35,
         0xb5, 0x06, 0x00, 0x91, 0xf7, 0x22, 0x00, 0x91 } },
-    /* FP4: il2cpp_string_new_len prologue.  Resolved by caller trace: 2064
-     * callers in 1206, 821 in 1224, with 64% post-BL instruction overlap.
-     * The 16-byte prologue is byte-identical to 1206. */
-    { UINT64_C(0x0413f2cc),
+    /* FP4: 1234 string-copy constructor prologue used as an image pin only. */
+    { UINT64_C(0x0413d37c),
       { 0xff, 0x43, 0x01, 0xd1, 0xfe, 0x13, 0x00, 0xf9,
         0xf6, 0x57, 0x03, 0xa9, 0xf4, 0x4f, 0x04, 0xa9 } },
-    /* FP5: mov x20,x0; ldr x1,[x8,#0x5d0]; bl; adrp.  The first two
-     * instructions are byte-identical; unique 4-instruction window in 1224. */
-    { UINT64_C(0x0ea5dc20),
-      { 0xf4, 0x03, 0x00, 0xaa, 0x01, 0xe9, 0x42, 0xf9,
-        0x6c, 0x15, 0x5e, 0x96, 0x88, 0x03, 0x03, 0xd0 } },
   };
 
   if (game_mod.load_size != GENSHIN_EXACT_LOAD_SIZE) return 0;
@@ -2766,11 +2754,9 @@ int main(int argc, char **argv) {
     const int render_continues = unity_render(fake_env, fake_unityplayer_thiz);
     jni_boundary_end();
     g_render_in_progress = 0;
-    /* Exact-image call chain: nativeRender RVA 0x49c3cd4 reaches
-     * 0x49bb288 -> 0x531ff84 -> 0x44974e8 -> 0x44ac054.  That final function
-     * performs the 0x100800000-byte mmap through 0x44b5748 and publishes the
-     * three allocator globals.  initJni does not reach this path, so the slab
-     * invariant becomes meaningful only after the first nativeRender call. */
+    /* The exact 1234 nativeRender path performs the 0x100800000-byte mmap and
+     * publishes the three allocator globals.  initJni does not reach this
+     * path, so the slab invariant is meaningful only after the first render. */
     if (!first_render_done)
       validate_unity_slab_client_state(unity_slab_reservation,
                                        unity_slab_reservation_size);

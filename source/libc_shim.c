@@ -2031,7 +2031,7 @@ extern NxMemoryBackingBackend g_memory_backing_backend;
 #define BIONIC_PROT_READ 0x1
 #define BIONIC_PROT_WRITE 0x2
 
-/* Exact 7.0.0 Unity allocator request: a 4 GiB slab space plus one 8 MiB
+/* Exact 7.0.1 Unity allocator request: a 4 GiB slab space plus one 8 MiB
  * alignment guard.  Android reserves the address range and backs it on first
  * touch.  Keep the same split on Horizon: the whole range is only a libnx
  * virtual reservation, while the exact 8 MiB slab selected by Unity is mapped
@@ -9000,7 +9000,7 @@ int sem_timedwait_fake(void *storage,const struct timespec *absolute){
 }
 
 /* Genshin merges a customized Unity 2017 IL2CPP runtime into libyuanshen.
- * These offsets were derived from the exact supported 7.0.0 image rather than
+ * These offsets were derived from the exact supported 7.0.1 image rather than
  * copied from the Subway/Unity-2022 wrapper.  Its signal-30 handler publishes
  * ucontext+0xb0 and SP into the per-thread record, increments suspend_ack,
  * waits for resume_flag, clears the context pointer, then increments
@@ -9026,17 +9026,16 @@ volatile uint32_t g_gc_bridge_deferred_deliveries;
 volatile uint32_t g_gc_bridge_mutex_dependency_releases;
 volatile uint32_t g_gc_bridge_mutex_release_failures;
 
-#define GI_GC_SIGNAL_RVA       UINT64_C(0x14df3230)
-#define GI_GC_SUSPEND_ACK_RVA  UINT64_C(0x14df3238)
-#define GI_GC_RESUME_ACK_RVA   UINT64_C(0x14df323c)
-#define GI_GC_RESUME_FLAG_RVA  UINT64_C(0x14df3240)
-#define GI_GC_THREADS_BEGIN_RVA UINT64_C(0x14df3250)
-#define GI_GC_THREADS_END_RVA   UINT64_C(0x14df3258)
-/* Pinned 7.0.0 GC service handshake.  RVA 0x044c304c posts work through
- * request/completion at 0x14ff3c48/4c; the worker entry is 0x044caaa4. */
-#define GI_GC_WORKER_ENTRY_RVA UINT64_C(0x044caaa4)
-#define GI_GC_REQUEST_RVA      UINT64_C(0x14ff3c48)
-#define GI_GC_COMPLETION_RVA   UINT64_C(0x14ff3c4c)
+#define GI_GC_SIGNAL_RVA       UINT64_C(0x14df3af0)
+#define GI_GC_SUSPEND_ACK_RVA  UINT64_C(0x14df3af8)
+#define GI_GC_RESUME_ACK_RVA   UINT64_C(0x14df3afc)
+#define GI_GC_RESUME_FLAG_RVA  UINT64_C(0x14df3b00)
+#define GI_GC_THREADS_BEGIN_RVA UINT64_C(0x14df3b10)
+#define GI_GC_THREADS_END_RVA   UINT64_C(0x14df3b18)
+/* Pinned 7.0.1 GC service handshake. */
+#define GI_GC_WORKER_ENTRY_RVA UINT64_C(0x044c8994)
+#define GI_GC_REQUEST_RVA      UINT64_C(0x14ff4508)
+#define GI_GC_COMPLETION_RVA   UINT64_C(0x14ff450c)
 #define GI_GC_RECORD_CONTEXT_OFF 8u
 #define GI_GC_RECORD_SP_OFF      32u
 #define GI_GC_RECORD_ACTIVE_OFF  72u

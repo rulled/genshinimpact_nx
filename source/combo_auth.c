@@ -23,7 +23,7 @@
 #include "json_min.h"
 
 /* These production endpoints and client identifiers are copied from the
- * reviewed 7.0.0 assets/server_env_config.json entry (area=os, env=2). */
+ * reviewed 7.0.1 assets/server_env_config.json entry (area=os, env=2). */
 #define PASSPORT_TLS_PREFLIGHT_URL \
   "https://hk4e-sdk-os.hoyoverse.com/hk4e_global/account/ma-passport/api/getConfig"
 #define PASSPORT_PASSWORD_URL \
@@ -752,7 +752,7 @@ static CURLcode http_post_json(const char *url, struct curl_slist *headers,
   curl_easy_setopt(curl, CURLOPT_CAINFO, CA_BUNDLE_PATH);
   curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
   curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-  curl_easy_setopt(curl, CURLOPT_USERAGENT, "GenshinImpact/7.0.0 Android");
+  curl_easy_setopt(curl, CURLOPT_USERAGENT, "GenshinImpact/7.0.1 Android");
   const CURLcode result = curl_easy_perform(curl);
   if (result == CURLE_OK)
     (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, http_status);
@@ -2257,7 +2257,7 @@ static void run_preflight(void) {
     curl_easy_setopt(curl, CURLOPT_CAINFO, CA_BUNDLE_PATH);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "GenshinImpact/7.0.0 Android");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "GenshinImpact/7.0.1 Android");
     result = curl_easy_perform(curl);
     if (result == CURLE_OK)
       (void)curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_status);

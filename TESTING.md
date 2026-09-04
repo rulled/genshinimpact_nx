@@ -1,9 +1,10 @@
 # Native hardware smoke test
 
-> **Client 1224 (Genshin 7.0.0) verified 2026-09-02:** this branch reaches the
-> account-login screen on real Switch hardware (Hoyoverse logo → Genshin logo
-> → login screen, steady heartbeat at frame 1320, `used=2591M/total=3093M`).
-> The pinned binary RVAs and fingerprints below are the validated 7.0.0 set.
+> **Client 1234 (Genshin 7.0.1) is awaiting hardware verification.** Its RVAs,
+> fingerprints, metadata, and signer were statically revalidated against the
+> supplied 1224 and 1234 XAPKs. Client 1224 reached the account-login screen on
+> real Switch hardware; do not assume 1234 is verified until this smoke test
+> completes.
 
 This procedure tests the Horizon/libnx wrapper only. It does not require or
 configure a private game server.
@@ -19,11 +20,11 @@ configure a private game server.
 
 ```text
 Package: com.miHoYo.GenshinImpact
-VersionCode: 1224
-Version: 7.0.0_47144228_47194594
+VersionCode: 1234
+Version: 7.0.1_47144228_47194594
 Unity: 2017.4.30f1
 libyuanshen.so SHA-256:
-26c862b147d2822a39e5464e761611767abaec1a541698ac53f80c135a9a42d1
+09b2d7593ce48ea30bbdad66983a207672f255dd5c477bc64b27d980dc460eec
 ```
 
 Do not use an official account for experimental wrapper testing.

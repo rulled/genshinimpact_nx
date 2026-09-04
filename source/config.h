@@ -1,4 +1,4 @@
-/* Genshin Impact 7.0.0 Switch wrapper configuration. */
+/* Genshin Impact 7.0.1 Switch wrapper configuration. */
 
 #ifndef __CONFIG_H__
 #define __CONFIG_H__
@@ -36,10 +36,10 @@
 #define OC_BROKER_LARGE_ALLOC_BYTES ((size_t)1 * 1024 * 1024)
 
 #define SS_PACKAGE        "com.miHoYo.GenshinImpact"
-#define SS_VERSION_CODE   1224
-#define SS_VERSION_NAME   "7.0.0_47144228_47194594"
+#define SS_VERSION_CODE   1234
+#define SS_VERSION_NAME   "7.0.1_47144228_47194594"
 
-/* Exact values returned by the bundled 7.0.0 Combo InfoModule.  They are
+/* Exact values returned by the bundled 7.0.1 Combo InfoModule.  They are
  * sourced from assets/channel_config_v1.5.json for the reviewed client, not
  * account credentials or server-issued login data. */
 #define GENSHIN_CHANNEL_ID_TEXT      "1"

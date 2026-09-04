@@ -1,5 +1,5 @@
 /* Caller-local bridge for the four Mmoron managed-path instructions replaced
- * at guest RVA 0xC684DD4.
+ * at guest RVA 0xC68421C.
  *
  * x20 is the live MmoronInitParams object.  Pass it through the normal C ABI,
  * then resume with x0 holding Path.Combine's result.  The C helper preserves

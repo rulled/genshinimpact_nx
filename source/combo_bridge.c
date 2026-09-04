@@ -1,4 +1,4 @@
-/* Safe native-to-Unity queue for the exact Genshin 7.0.0 Combo callback ABI. */
+/* Safe native-to-Unity queue for the exact Genshin 7.0.1 Combo callback ABI. */
 
 #include <switch.h>
 
@@ -9,7 +9,7 @@
 
 #include "combo_bridge.h"
 
-#define UNITY_SEND_MESSAGE_RVA 0x04DF4104u
+#define UNITY_SEND_MESSAGE_RVA 0x04DF1FF4u
 #define COMBO_EVENT_CAPACITY 64u
 #define COMBO_PENDING_CAPACITY 64u
 #define COMBO_PAYLOAD_CAPACITY (256u * 1024u)
