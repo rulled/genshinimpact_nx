@@ -100,3 +100,29 @@ The current public NVK backend is experimental. It has reached the account-login
 screen on hardware, but a later Vulkan failure does not by itself prove that the
 Android/Unity compatibility layer is broken. Include the complete diagnostic set
 and the NRO hash when reporting it.
+
+## Optional harvested device profile
+
+The synthetic Nintendo/Switch identity is rejected by the game's server-side
+risk control at game entry. The wrapper can instead report a consistent real
+Android device identity harvested over adb from a device that already plays
+the supported client:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\harvest_device_profile.ps1
+```
+
+Copy the generated file to:
+
+```text
+sdmc:/config/genshinimpact_nx/device_profile.ini
+```
+
+The file is optional; absent keys keep the built-in defaults. Recognized keys:
+`model`, `device_name`, `manufacturer`, `brand`, `product`, `device`, `board`,
+`hardware`, `platform`, `fingerprint`, `version_release`, `version_sdk`,
+`security_patch`, `incremental`, `android_id` (16 hex digits; app-scoped on
+modern Android, so the system `settings` value may not match what the game
+sees), and `device_fp` (SDK fingerprint session token; usually left unset).
+The profile is applied uniformly to system properties, JNI `Build.*` fields,
+and the Passport/Combo `x-rpc-device_*` headers.

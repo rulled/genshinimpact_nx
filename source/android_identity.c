@@ -17,6 +17,7 @@
 
 #include "android_identity.h"
 #include "config.h"
+#include "device_profile.h"
 
 #define IDENTITY_DIR "sdmc:/config/genshinimpact_nx"
 #define ANDROID_ID_PATH IDENTITY_DIR "/android_id"
@@ -137,6 +138,11 @@ void android_identity_init(const char *no_backup_dir) {
 }
 
 const char *android_identity_android_id(void) {
+  /* A harvested device profile may pin ANDROID_ID to the real device's
+   * value (validated as 16 hex digits at load time) so the account keeps
+   * one stable device identity across the real client and this port. */
+  const char *override = device_profile_get("android_id");
+  if (override) return override;
   return install_android_id;
 }
 

@@ -501,6 +501,7 @@ void network_configure_long_stream_receive_window(uint32_t initial_size,
                                                   uint32_t maximum_size);
 void network_configure_datagram_receive_window(uint32_t initial_size,
                                                uint32_t maximum_size);
+void libc_shim_apply_device_profile(void);
 void network_track_duplicate(int source, int target);
 int socket_fake(int d, int t, int p);
 int connect_fake(int s, const void *a, unsigned l);

@@ -22,6 +22,7 @@
 #include "combo_bridge.h"
 #include "combo_crypto.h"
 #include "config.h"
+#include "device_profile.h"
 #include "error.h"
 #include "genshin_compat.h"
 #include "imports.h"
@@ -2338,6 +2339,12 @@ int main(int argc, char **argv) {
    * ordinary allocations. */
   check_syscalls();
   validate_fixed_heap_reclaim();
+
+  /* Optional harvested-device identity (see tools/harvest_device_profile.ps1):
+   * must be ready before the Passport client, JNI fake and Unity property
+   * lookups read device identity. */
+  device_profile_init();
+  libc_shim_apply_device_profile();
 
   const char *config_path = DATA_ROOT "/" CONFIG_NAME;
   if (read_config(config_path) != 0) write_config(config_path);

@@ -18,6 +18,7 @@
 
 #include "config.h"
 #include "android_identity.h"
+#include "device_profile.h"
 #include "jni_fake.h"
 #include "android_native_unity.h"
 #include "imports.h"
@@ -2191,26 +2192,26 @@ static void *field_object(const FakeID *id) {
     if (!strcmp(n, "FEATURE_AUDIO_PRO"))         return jni_make_string("android.hardware.audio.pro");
   }
   if (name_has(c, "os/Build")) {
-    if (!strcmp(n, "MODEL"))        return jni_make_string("Switch");
-    if (!strcmp(n, "MANUFACTURER")) return jni_make_string("Nintendo");
-    if (!strcmp(n, "BRAND"))        return jni_make_string("Nintendo");
-    if (!strcmp(n, "DEVICE"))       return jni_make_string("Switch");
-    if (!strcmp(n, "PRODUCT"))      return jni_make_string("Switch");
-    if (!strcmp(n, "HARDWARE"))     return jni_make_string("nx");
-    if (!strcmp(n, "BOARD"))        return jni_make_string("nx");
-    if (!strcmp(n, "DISPLAY"))      return jni_make_string("nx");
+    if (!strcmp(n, "MODEL"))        return jni_make_string(device_profile_or("model", "Switch"));
+    if (!strcmp(n, "MANUFACTURER")) return jni_make_string(device_profile_or("manufacturer", "Nintendo"));
+    if (!strcmp(n, "BRAND"))        return jni_make_string(device_profile_or("brand", "Nintendo"));
+    if (!strcmp(n, "DEVICE"))       return jni_make_string(device_profile_or("device", "Switch"));
+    if (!strcmp(n, "PRODUCT"))      return jni_make_string(device_profile_or("product", "Switch"));
+    if (!strcmp(n, "HARDWARE"))     return jni_make_string(device_profile_or("hardware", "nx"));
+    if (!strcmp(n, "BOARD"))        return jni_make_string(device_profile_or("board", "nx"));
+    if (!strcmp(n, "DISPLAY"))      return jni_make_string(device_profile_or("incremental", "nx"));
     if (!strcmp(n, "ID"))           return jni_make_string("REL");
     if (!strcmp(n, "TYPE"))         return jni_make_string("user");
     if (!strcmp(n, "TAGS"))         return jni_make_string("release-keys");
-    if (!strcmp(n, "FINGERPRINT"))  return jni_make_string("Nintendo/Switch/Switch:13/REL/10007:user/release-keys");
+    if (!strcmp(n, "FINGERPRINT"))  return jni_make_string(device_profile_or("fingerprint", "Nintendo/Switch/Switch:13/REL/10007:user/release-keys"));
     if (!strcmp(n, "BOOTLOADER"))   return jni_make_string("unknown");
     if (!strcmp(n, "HOST"))         return jni_make_string("localhost");
     if (!strcmp(n, "USER"))         return jni_make_string("nx");
     if (!strcmp(n, "SERIAL"))       return jni_make_string("unknown");
-    if (!strcmp(n, "RELEASE"))      return jni_make_string("13");        /* Build.VERSION.* */
+    if (!strcmp(n, "RELEASE"))      return jni_make_string(device_profile_or("version_release", "13"));        /* Build.VERSION.* */
     if (!strcmp(n, "CODENAME"))     return jni_make_string("REL");
-    if (!strcmp(n, "INCREMENTAL"))  return jni_make_string("10007");
-    if (!strcmp(n, "SECURITY_PATCH")) return jni_make_string("2023-01-01");
+    if (!strcmp(n, "INCREMENTAL"))  return jni_make_string(device_profile_or("incremental", "10007"));
+    if (!strcmp(n, "SECURITY_PATCH")) return jni_make_string(device_profile_or("security_patch", "2023-01-01"));
     if (!strcmp(n, "BASE_OS"))      return jni_make_string("");
   }
   if (name_has(c,"pm/PackageInfo") && !strcmp(n,"applicationInfo"))

@@ -43,6 +43,7 @@
 #include "vulkan_bridge.h"
 #include "genshin_compat.h"
 #include "asset_pack.h"
+#include "device_profile.h"
 #include "plugin_loader.h"
 #include "unity_entrypoints.h"
 #include "android_log_sink.h"
@@ -91,7 +92,7 @@ struct FakePropInfo {
 _Static_assert(sizeof(FakePropInfo) == 124,
                "bounded synthetic property record size");
 
-static const FakePropInfo system_properties[] = {
+static FakePropInfo system_properties[] = {
   { "ro.build.version.sdk", "33" },
   { "ro.build.version.release", "13" },
   { "ro.build.version.codename", "REL" },
@@ -138,6 +139,40 @@ static void copy_system_property_text(char *destination, const char *source,
   const size_t length = strnlen(source, capacity - 1);
   memcpy(destination, source, length);
   destination[length] = '\0';
+}
+
+/* Overlay the optional device profile onto the synthetic property table
+ * before the guest starts querying it.  The table pointers stay stable
+ * (only values are rewritten in place, bounded by PROP_VALUE_MAX), so the
+ * __system_property_read_fake identity validation keeps working. */
+void libc_shim_apply_device_profile(void) {
+  static const struct {
+    const char *key;
+    const char *prop;
+  } map[] = {
+    { "model", "ro.product.model" },
+    { "manufacturer", "ro.product.manufacturer" },
+    { "brand", "ro.product.brand" },
+    { "product", "ro.product.name" },
+    { "device", "ro.product.device" },
+    { "board", "ro.product.board" },
+    { "hardware", "ro.hardware" },
+    { "platform", "ro.board.platform" },
+    { "fingerprint", "ro.build.fingerprint" },
+    { "version_release", "ro.build.version.release" },
+    { "version_sdk", "ro.build.version.sdk" },
+  };
+  for (size_t m = 0; m < sizeof map / sizeof map[0]; ++m) {
+    const char *value = device_profile_get(map[m].key);
+    if (!value) continue;
+    for (size_t i = 0;
+         i < sizeof system_properties / sizeof system_properties[0]; ++i) {
+      if (strcmp(system_properties[i].name, map[m].prop)) continue;
+      copy_system_property_text(system_properties[i].value, value,
+                                BIONIC_PROP_VALUE_MAX);
+      break;
+    }
+  }
 }
 
 const FakePropInfo *__system_property_find_fake(const char *name) {
