@@ -22,6 +22,7 @@
 #include "combo_bridge.h"
 #include "combo_crypto.h"
 #include "config.h"
+#include "device_profile.h"
 #include "error.h"
 #include "genshin_compat.h"
 #include "imports.h"
@@ -44,6 +45,12 @@
 #define STARTUP_METADATA_SIZE ((size_t)3932952)
 #define STARTUP_METADATA_MAP_SIZE ((size_t)0x3c1000)
 #define NETWORK_BSD_SESSION_COUNT 16u
+/* KCP bulk download rides on UDP datagrams.  libnx reserves datagram
+ * receive queues up front (there is no udp max growth field), so the only
+ * way to enlarge them is a bigger udp_rx_buf_size at socketInitialize.
+ * The BSD service rejects oversized reservations; main() falls back to the
+ * hardware-proven default tuple in that case. */
+#define NETWORK_UDP_RX_BUF_CANDIDATE 0x40000u
 
 void unity_environment_init(const char *data_root); /* unity_glue.c */
 
@@ -2287,6 +2294,35 @@ int main(int argc, char **argv) {
     putenv(rust_backtrace_env);
   }
 
+  /* NVK/Mesa env vars for the resource-download device-lost investigation
+   * (vkQueueSubmit #1001 returns VK_ERROR_DEVICE_LOST after
+   * FilesDownloadPipe StartDownload).  NVK is statically linked into this NRO
+   * and reads the same environ; getenv_fake (libc_shim.c) passes unknown vars
+   * through to the real getenv, so these reach the driver without code changes
+   * to the Vulkan path.
+   *
+   * NVK_DEBUG=push_sync serializes each push-buffer submission: if the
+   * device-lost disappears under it, the hang is timing/watchdog-induced
+   * (download-burst overrunning the nvhost channel) and a fence-throttle in
+   * the existing nx_vkQueueSubmit hook is the productionizable fix.  If it
+   * persists on the same submit, the offending command buffer is
+   * deterministic and Mesa-side.  push_dump captures that buffer to
+   * stderr.txt (bound above).
+   *
+   * MESA_VK_ABORT_ON_DEVICE_LOST turns the first device-lost into a SIGABRT
+   * instead of a silent -4 return the game then mishandles; combined with
+   * RUST_BACKTRACE=1 this yields a backtrace at the failing submit. */
+  {
+    static char nvk_debug_env[] = "NVK_DEBUG=push_sync";
+    static char nvk_dump_env[] = "NVK_DEBUG=push_sync,push_dump";
+    static char abort_env[] = "MESA_VK_ABORT_ON_DEVICE_LOST=1";
+    /* push_sync alone first; add push_dump on a follow-up build if the hang
+     * survives serialization, to keep stderr.txt from filling on good runs. */
+    (void)nvk_dump_env;
+    putenv(nvk_debug_env);
+    putenv(abort_env);
+  }
+
   startup_status_begin("Validating the Android client");
   if (chdir(DATA_ROOT) != 0)
     fatal_error("Could not enter %s. Copy the staged game directory to the SD card.",
@@ -2303,6 +2339,12 @@ int main(int argc, char **argv) {
    * ordinary allocations. */
   check_syscalls();
   validate_fixed_heap_reclaim();
+
+  /* Optional harvested-device identity (see tools/harvest_device_profile.ps1):
+   * must be ready before the Passport client, JNI fake and Unity property
+   * lookups read device identity. */
+  device_profile_init();
+  libc_shim_apply_device_profile();
 
   const char *config_path = DATA_ROOT "/" CONFIG_NAME;
   if (read_config(config_path) != 0) write_config(config_path);
@@ -2335,17 +2377,34 @@ int main(int argc, char **argv) {
   const Result nifm_result = nifmInitialize(NifmServiceType_User);
   nifm_started = R_SUCCEEDED(nifm_result);
   /* Unity performs networking from many workers.  Raise only the BSD IPC
-   * session count: this exact default-buffer/16-session tuple reached the
-   * installer and sustained the first large resource transfer on hardware.
-   * Oversized per-socket buffers later stalled post-login server dispatch. */
+   * session count and the datagram receive queue: this exact
+   * default-TCP-buffer/16-session tuple reached the installer and
+   * sustained the first large resource transfer on hardware.  Oversized
+   * TCP per-socket buffers later stalled post-login server dispatch, so
+   * TCP sizes stay at the defaults; UDP only carries the KCP download,
+   * which the small default queue (0xA500) overflows under bursts. */
   SocketInitConfig socket_config = *socketGetDefaultInitConfig();
   socket_config.num_bsd_sessions = NETWORK_BSD_SESSION_COUNT;
-  const Result socket_result = socketInitialize(&socket_config);
+  const uint32_t default_udp_rx_buf_size = socket_config.udp_rx_buf_size;
+  socket_config.udp_rx_buf_size = NETWORK_UDP_RX_BUF_CANDIDATE;
+  Result socket_result = socketInitialize(&socket_config);
+  if (R_FAILED(socket_result) &&
+      socket_config.udp_rx_buf_size != default_udp_rx_buf_size) {
+    /* socketInitialize already cleaned up its partial state on failure. */
+    socket_config.udp_rx_buf_size = default_udp_rx_buf_size;
+    socket_result = socketInitialize(&socket_config);
+  }
+  const uint32_t effective_udp_rx_buf_size = socket_config.udp_rx_buf_size;
+  const uint32_t configured_udp_rx_max =
+    socket_config.tcp_rx_buf_max_size; /* datagram promotion ceiling */
   socket_started = R_SUCCEEDED(socket_result);
   g_net_on = socket_started;
   network_configure_long_stream_receive_window(
     socket_started ? socket_config.tcp_rx_buf_size : 0,
     socket_started ? socket_config.tcp_rx_buf_max_size : 0);
+  network_configure_datagram_receive_window(
+    socket_started ? effective_udp_rx_buf_size : 0,
+    socket_started ? configured_udp_rx_max : 0);
 
   if (!socket_started)
     fatal_error("Nintendo Switch socket services could not be initialized.");
@@ -2586,6 +2645,8 @@ int main(int argc, char **argv) {
     if (frame_count % 120 == 0) {
       NxSparseArenaDiagnostics diag = {0};
       nx_sparse_arena_get_diagnostics(&diag);
+      NetworkTransportDiagnostics net = {0};
+      network_get_transport_diagnostics(&net);
       FILE *lf = fopen(DATA_ROOT "/run_log.txt", "ab");
       if (lf) {
         const unsigned long long MiB = 1024ull * 1024ull;
@@ -2600,6 +2661,83 @@ int main(int argc, char **argv) {
                 diag.dynamic_mapped_bytes / MiB,
                 (unsigned long long)diag.backing_unmap_ok,
                 (unsigned long long)diag.backing_unmap_fail);
+        /* Network transport telemetry.  rxall counts payload from BOTH the
+         * TCP and UDP paths (the counter is fed by every bionic recv
+         * variant), so bulk KCP traffic is included here as well; the
+         * dedicated net-udp line below separates it.  long_stream_window_*
+         * show whether the stream SO_RCVBUF promotion fired and what
+         * effective window each bulk stream got.  Without this the ~350
+         * kbit/s download cap was unobservable. */
+        const unsigned long long KiB = 1024ull;
+        fprintf(lf,
+                "[I] net: rxall=%lluB/%llu rxfail=%llu wblock=%llu "
+                "rcvbuf win att=%llu ok=%llu fail=%llu eff=%lluB "
+                "largest=%lluB streams=%llu/%llu\n",
+                (unsigned long long)net.received_bytes,
+                (unsigned long long)net.recv_calls,
+                (unsigned long long)net.recv_failures,
+                (unsigned long long)net.recv_would_block,
+                (unsigned long long)net.long_stream_window_attempts,
+                (unsigned long long)net.long_stream_window_successes,
+                (unsigned long long)net.long_stream_window_failures,
+                (unsigned long long)net.last_long_stream_window_effective,
+                (unsigned long long)net.largest_stream_received_bytes,
+                (unsigned long long)net.receiving_stream_sockets,
+                (unsigned long long)net.tracked_stream_sockets);
+        /* UDP/KCP transport telemetry.  Genshin's bulk resource download runs
+         * over KCP (reliable UDP via recvmsg/recvfrom), so the TCP line above
+         * freezes at the control-traffic total while gigabytes flow here.
+         * Diff udp_recv_bytes between two consecutive heartbeat lines (120
+         * frames apart) for actual download throughput.  udp_receive_errors
+         * rising against udp_recv_calls indicates packet loss / KCP
+         * retransmit pressure, which is a candidate root of the ~350 kbit/s
+         * cap. */
+        fprintf(lf,
+                "[I] net-udp: recv=%lluB/%llu sent=%lluB/%llu "
+                "rxfail=%llu dgram=%llu largest=%lluB "
+                "win att=%llu ok=%llu fail=%llu eff=%lluB tgt=%lluB\n",
+                (unsigned long long)net.udp_received_bytes,
+                (unsigned long long)net.udp_recv_calls,
+                (unsigned long long)net.udp_sent_bytes,
+                (unsigned long long)net.udp_send_calls,
+                (unsigned long long)net.udp_receive_errors,
+                (unsigned long long)net.tracked_datagram_sockets,
+                (unsigned long long)net.largest_datagram_received_bytes,
+                (unsigned long long)net.datagram_window_attempts,
+                (unsigned long long)net.datagram_window_successes,
+                (unsigned long long)net.datagram_window_failures,
+                (unsigned long long)net.last_datagram_window_effective,
+                (unsigned long long)net.datagram_receive_window_target);
+        (void)KiB;
+        /* Donor headroom + file-IO trim-stall telemetry.  During the download
+         * verification phase (~50GB of .blk hashed at once) the heap-donor pool
+         * approaches its ceiling and finalize_fd fsFileSetSize IPCs can stall.
+         * headroom = donor_capacity - donor_active; when it nears zero the
+         * next file-backed mmap can trip svcSetHeapSize under memory pressure
+         * and wedge the system.  fio_active/oldest_ms expose a stuck trim:
+         * oldest_ms climbing across heartbeats = a finalize_fd IPC not
+         * returning.  pool_free=UINT64_MAX is the "broker busy" sentinel set
+         * when g_mmap_lock could not be try-locked (the hang signature). */
+        NxFileIoDiagnostics fio = {0};
+        nx_file_io_get_diagnostics(&fio);
+        const unsigned long long donor_cap = diag.donor_capacity_bytes / MiB;
+        const unsigned long long donor_head =
+          (diag.donor_capacity_bytes > diag.donor_active_bytes)
+            ? (diag.donor_capacity_bytes - diag.donor_active_bytes) / MiB
+            : 0;
+        const unsigned long long pool_free = diag.pool_free_bytes;
+        fprintf(lf,
+                "[I] mem: cap=%lluM head=%lluM pool_free=%lluB "
+                "fio_active=%llu oldest=%llums slot=%u kind=%u fin=%llu/%llu\n",
+                donor_cap, donor_head,
+                (pool_free == UINT64_MAX) ? UINT64_MAX : pool_free,
+                (unsigned long long)fio.size_operations_active,
+                (unsigned long long)fio.oldest_size_operation_ms,
+                (fio.oldest_size_operation_slot == UINT32_MAX)
+                  ? 0u : fio.oldest_size_operation_slot,
+                fio.oldest_size_operation_kind,
+                (unsigned long long)fio.finalize_calls,
+                (unsigned long long)fio.finalize_failures);
         fclose(lf);
       }
     }

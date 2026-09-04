@@ -429,6 +429,15 @@ typedef struct {
   uint64_t long_stream_window_failures;
   int32_t last_long_stream_window_error;
   uint64_t last_long_stream_window_effective;
+  /* Datagram receive-window promotion (KCP/UDP bulk download).  Mirrors the
+   * stream fields: att/ok/fail count one-shot SO_RCVBUF promotions per
+   * datagram socket, eff is the effective window the BSD service granted. */
+  uint64_t datagram_receive_window_target;
+  uint64_t datagram_window_attempts;
+  uint64_t datagram_window_successes;
+  uint64_t datagram_window_failures;
+  int32_t last_datagram_window_error;
+  uint64_t last_datagram_window_effective;
   uint64_t tracked_stream_sockets;
   uint64_t receiving_stream_sockets;
   uint64_t stalled_stream_sockets;
@@ -473,11 +482,26 @@ typedef struct {
   uint64_t stalled_queued_last_poll_tick_ns;
   uintptr_t stalled_queued_recv_thread;
   uintptr_t stalled_queued_poll_thread;
+  /* UDP/KCP transport.  Genshin's bulk resource download runs over KCP
+   * (reliable UDP via recvmsg/recvfrom), NOT TCP, so the TCP receive-window
+   * telemetry above stays frozen while gigabytes flow here.  These aggregate
+   * the per-socket udp_* counters so the download throughput is observable. */
+  uint64_t udp_recv_calls;
+  uint64_t udp_received_bytes;
+  uint64_t udp_send_calls;
+  uint64_t udp_sent_bytes;
+  uint64_t udp_receive_errors;
+  uint64_t tracked_datagram_sockets;
+  uint64_t largest_datagram_received_bytes;
+  uint64_t last_udp_receive_tick_ns;
 } NetworkTransportDiagnostics;
 
 int network_get_transport_diagnostics(NetworkTransportDiagnostics *out);
 void network_configure_long_stream_receive_window(uint32_t initial_size,
-                                                   uint32_t maximum_size);
+                                                  uint32_t maximum_size);
+void network_configure_datagram_receive_window(uint32_t initial_size,
+                                               uint32_t maximum_size);
+void libc_shim_apply_device_profile(void);
 void network_track_duplicate(int source, int target);
 int socket_fake(int d, int t, int p);
 int connect_fake(int s, const void *a, unsigned l);

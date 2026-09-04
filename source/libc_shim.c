@@ -43,6 +43,7 @@
 #include "vulkan_bridge.h"
 #include "genshin_compat.h"
 #include "asset_pack.h"
+#include "device_profile.h"
 #include "plugin_loader.h"
 #include "unity_entrypoints.h"
 #include "android_log_sink.h"
@@ -91,7 +92,7 @@ struct FakePropInfo {
 _Static_assert(sizeof(FakePropInfo) == 124,
                "bounded synthetic property record size");
 
-static const FakePropInfo system_properties[] = {
+static FakePropInfo system_properties[] = {
   { "ro.build.version.sdk", "33" },
   { "ro.build.version.release", "13" },
   { "ro.build.version.codename", "REL" },
@@ -138,6 +139,40 @@ static void copy_system_property_text(char *destination, const char *source,
   const size_t length = strnlen(source, capacity - 1);
   memcpy(destination, source, length);
   destination[length] = '\0';
+}
+
+/* Overlay the optional device profile onto the synthetic property table
+ * before the guest starts querying it.  The table pointers stay stable
+ * (only values are rewritten in place, bounded by PROP_VALUE_MAX), so the
+ * __system_property_read_fake identity validation keeps working. */
+void libc_shim_apply_device_profile(void) {
+  static const struct {
+    const char *key;
+    const char *prop;
+  } map[] = {
+    { "model", "ro.product.model" },
+    { "manufacturer", "ro.product.manufacturer" },
+    { "brand", "ro.product.brand" },
+    { "product", "ro.product.name" },
+    { "device", "ro.product.device" },
+    { "board", "ro.product.board" },
+    { "hardware", "ro.hardware" },
+    { "platform", "ro.board.platform" },
+    { "fingerprint", "ro.build.fingerprint" },
+    { "version_release", "ro.build.version.release" },
+    { "version_sdk", "ro.build.version.sdk" },
+  };
+  for (size_t m = 0; m < sizeof map / sizeof map[0]; ++m) {
+    const char *value = device_profile_get(map[m].key);
+    if (!value) continue;
+    for (size_t i = 0;
+         i < sizeof system_properties / sizeof system_properties[0]; ++i) {
+      if (strcmp(system_properties[i].name, map[m].prop)) continue;
+      copy_system_property_text(system_properties[i].value, value,
+                                BIONIC_PROP_VALUE_MAX);
+      break;
+    }
+  }
 }
 
 const FakePropInfo *__system_property_find_fake(const char *name) {
@@ -3696,18 +3731,33 @@ void nx_sparse_arena_get_diagnostics(NxSparseArenaDiagnostics *out) {
 
   if (oc_dynamic_metadata_ready &&
       !mutexIsLockedByCurrentThread(&g_mmap_lock)) {
-    mmap_broker_lock();
-    uint64_t free_pages = 0;
-    uint64_t largest_pages = 0;
-    for (uint32_t node = oc_dynamic_extent_head; node;
-         node = oc_dynamic_extents[node].next) {
-      free_pages += oc_dynamic_extents[node].pages;
-      if (oc_dynamic_extents[node].pages > largest_pages)
-        largest_pages = oc_dynamic_extents[node].pages;
+    /* Heartbeat diagnostics must never block.  mmap_broker_lock() is a
+     * spin-loop (mutexTryLock + svcSleepThread(0)); if the holder of
+     * g_mmap_lock is wedged in a kernel SVC (the verification hang), the
+     * heartbeat thread would spin here forever, truncating the run log
+     * mid-heartbeat and hiding the very contention we need to see.  Use a
+     * one-shot try-lock: if the broker is busy, skip the free-list scan
+     * (pool_free_bytes stays 0) and let the caller record that the snapshot
+     * was deferred. */
+    nx_guest_gc_critical_enter();
+    const int locked = mutexTryLock(&g_mmap_lock);
+    nx_guest_gc_critical_leave();
+    if (locked) {
+      uint64_t free_pages = 0;
+      uint64_t largest_pages = 0;
+      for (uint32_t node = oc_dynamic_extent_head; node;
+           node = oc_dynamic_extents[node].next) {
+        free_pages += oc_dynamic_extents[node].pages;
+        if (oc_dynamic_extents[node].pages > largest_pages)
+          largest_pages = oc_dynamic_extents[node].pages;
+      }
+      mmap_broker_unlock();
+      out->pool_free_bytes = free_pages * MMAP_PAGE;
+      out->pool_largest_free_bytes = largest_pages * MMAP_PAGE;
+    } else {
+      out->pool_free_bytes = UINT64_MAX;  /* sentinel: broker busy */
+      out->pool_largest_free_bytes = UINT64_MAX;
     }
-    mmap_broker_unlock();
-    out->pool_free_bytes = free_pages * MMAP_PAGE;
-    out->pool_largest_free_bytes = largest_pages * MMAP_PAGE;
   }
 }
 
@@ -5333,6 +5383,7 @@ typedef struct {
   uint32_t stream;
   uint32_t datagram;
   uint32_t receive_window_state; /* 0=pending, 1=setting, 2=set, 3=failed */
+  uint32_t udp_receive_window_state; /* 0=pending, 1=setting, 2=set, 3=failed */
   uint32_t recv_inflight;
   uint32_t readiness_probe_state; /* 0=none/consumed, 1=valid, 2=failed */
   uint32_t udp_send_route_state; /* 0=unknown, 1=retain name, 2=connected peer */
@@ -5359,6 +5410,7 @@ typedef struct {
 static NetworkSocketProgress g_network_socket_progress[NETWORK_TRACKED_FD_LIMIT];
 static uint64_t g_network_socket_generation;
 static uint32_t g_network_long_stream_receive_window;
+static uint32_t g_network_datagram_receive_window;
 
 static int network_socket_is_datagram(int fd) {
   if (fd < 0 || fd >= NETWORK_TRACKED_FD_LIMIT) return 0;
@@ -5432,6 +5484,10 @@ static int network_udp_destination_is_connected_peer(
   return route_state == 2;
 }
 
+static void network_maybe_promote_datagram_window(int fd,
+                                                  NetworkSocketProgress *progress,
+                                                  uint64_t received_bytes);
+
 static void network_udp_record_send(int fd, long result) {
   if (!network_socket_is_datagram(fd)) return;
   NetworkSocketProgress *progress = &g_network_socket_progress[fd];
@@ -5461,9 +5517,17 @@ static void network_udp_record_receive(int fd, long result) {
 
     return;
   }
-  __atomic_fetch_add(&progress->udp_received_bytes, (uint64_t)result,
-                     __ATOMIC_RELAXED);
+  /* The KCP receive queue drains in bursts; the default Horizon datagram
+   * buffer is small enough that a burst plus any il2cpp GC pause overflows
+   * it, and the resulting silent loss collapses KCP into retransmit
+   * backoff.  Promote the datagram receive window once bulk traffic is
+   * confirmed, mirroring the stream promotion below. */
+  const uint64_t received_total = __atomic_add_fetch(
+    &progress->udp_received_bytes, (uint64_t)result, __ATOMIC_RELAXED);
+  __atomic_store_n(&progress->last_receive_tick_ns,
+                   armTicksToNs(armGetSystemTick()), __ATOMIC_RELAXED);
   __atomic_store_n(&progress->udp_last_receive_error, 0, __ATOMIC_RELAXED);
+  network_maybe_promote_datagram_window(fd, progress, received_total);
 }
 
 static void network_track_open(int fd, int native_type) {
@@ -5476,6 +5540,7 @@ static void network_track_open(int fd, int native_type) {
   __atomic_store_n(&progress->datagram, native_type == SOCK_DGRAM,
                    __ATOMIC_RELAXED);
   __atomic_store_n(&progress->receive_window_state, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&progress->udp_receive_window_state, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&progress->recv_inflight, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&progress->readiness_probe_state, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&progress->udp_send_route_state, 0, __ATOMIC_RELAXED);
@@ -5752,6 +5817,23 @@ void network_configure_long_stream_receive_window(uint32_t initial_size,
   NET_DIAG_STORE(long_stream_receive_window_target, target);
 }
 
+void network_configure_datagram_receive_window(uint32_t initial_size,
+                                               uint32_t maximum_size) {
+  /* Horizon's BSD config has no udp max field, so the datagram receive
+   * queue cannot grow past socketInitialize's reservation at runtime.
+   * main.c passes the TCP max as the ceiling: when the enlarged
+   * udp_rx_buf_size reservation was accepted the two match and the
+   * runtime promotion stays disabled (target 0); when the reservation
+   * fell back to the small default the promotion at least tries and the
+   * telemetry records the effective window the service granted. */
+  const uint32_t target = maximum_size > initial_size &&
+                          maximum_size <= (uint32_t)INT_MAX
+    ? maximum_size : 0;
+  __atomic_store_n(&g_network_datagram_receive_window, target,
+                   __ATOMIC_RELAXED);
+  NET_DIAG_STORE(datagram_receive_window_target, target);
+}
+
 static void network_maybe_promote_receive_window(
     int fd, NetworkSocketProgress *progress, uint64_t received_bytes) {
   if (!progress || received_bytes < NETWORK_BULK_MIN_BYTES) return;
@@ -5788,6 +5870,47 @@ static void network_maybe_promote_receive_window(
     NET_DIAG_ADD(long_stream_window_failures, 1);
     NET_DIAG_STORE(last_long_stream_window_error, n2b_errno(option_error));
     __atomic_store_n(&progress->receive_window_state, 3, __ATOMIC_RELEASE);
+  }
+}
+
+static void network_maybe_promote_datagram_window(
+    int fd, NetworkSocketProgress *progress, uint64_t received_bytes) {
+  if (!progress || received_bytes < NETWORK_BULK_MIN_BYTES) return;
+  const uint32_t target = __atomic_load_n(
+    &g_network_datagram_receive_window, __ATOMIC_RELAXED);
+  if (!target) return;
+  uint32_t expected = 0;
+  if (!__atomic_compare_exchange_n(&progress->udp_receive_window_state,
+                                    &expected, 1, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+    return;
+
+  NET_DIAG_ADD(datagram_window_attempts, 1);
+  const int saved_errno = errno;
+  const int requested = (int)target;
+  const int result = setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                                &requested, sizeof requested);
+  const int option_error = result < 0 ? errno : 0;
+  int effective = 0;
+  socklen_t effective_size = sizeof effective;
+  if (result == 0 &&
+      getsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                 &effective, &effective_size) < 0)
+    effective = requested;
+  errno = saved_errno;
+
+  if (result == 0) {
+    NET_DIAG_ADD(datagram_window_successes, 1);
+    NET_DIAG_STORE(last_datagram_window_error, 0);
+    NET_DIAG_STORE(last_datagram_window_effective,
+                   effective > 0 ? (uint64_t)effective : target);
+    __atomic_store_n(&progress->udp_receive_window_state, 2,
+                     __ATOMIC_RELEASE);
+  } else {
+    NET_DIAG_ADD(datagram_window_failures, 1);
+    NET_DIAG_STORE(last_datagram_window_error, n2b_errno(option_error));
+    __atomic_store_n(&progress->udp_receive_window_state, 3,
+                     __ATOMIC_RELEASE);
   }
 }
 
@@ -5884,6 +6007,12 @@ int network_get_transport_diagnostics(NetworkTransportDiagnostics *out) {
   NET_DIAG_LOAD(long_stream_window_failures);
   NET_DIAG_LOAD(last_long_stream_window_error);
   NET_DIAG_LOAD(last_long_stream_window_effective);
+  NET_DIAG_LOAD(datagram_receive_window_target);
+  NET_DIAG_LOAD(datagram_window_attempts);
+  NET_DIAG_LOAD(datagram_window_successes);
+  NET_DIAG_LOAD(datagram_window_failures);
+  NET_DIAG_LOAD(last_datagram_window_error);
+  NET_DIAG_LOAD(last_datagram_window_effective);
   NET_DIAG_LOAD(poll_readiness_probes);
   NET_DIAG_LOAD(poll_readiness_hits);
   NET_DIAG_LOAD(poll_readiness_probe_failures);
@@ -5919,6 +6048,14 @@ int network_get_transport_diagnostics(NetworkTransportDiagnostics *out) {
   out->stalled_queued_last_poll_tick_ns = 0;
   out->stalled_queued_recv_thread = 0;
   out->stalled_queued_poll_thread = 0;
+  out->udp_recv_calls = 0;
+  out->udp_received_bytes = 0;
+  out->udp_send_calls = 0;
+  out->udp_sent_bytes = 0;
+  out->udp_receive_errors = 0;
+  out->tracked_datagram_sockets = 0;
+  out->largest_datagram_received_bytes = 0;
+  out->last_udp_receive_tick_ns = 0;
   const uint64_t now_ns = armTicksToNs(armGetSystemTick());
   for (unsigned fd = 0; fd < NETWORK_TRACKED_FD_LIMIT; ++fd) {
     NetworkSocketProgress *progress = &g_network_socket_progress[fd];
@@ -5985,6 +6122,36 @@ int network_get_transport_diagnostics(NetworkTransportDiagnostics *out) {
         }
       }
     }
+  }
+
+  /* Aggregate UDP/KCP sockets separately.  Genshin's bulk resource download
+   * runs over KCP (reliable UDP via recvmsg/recvfrom), so without this pass
+   * the download throughput is invisible — the TCP counters above freeze at
+   * the control-traffic total while gigabytes flow here. */
+  for (unsigned fd = 0; fd < NETWORK_TRACKED_FD_LIMIT; ++fd) {
+    NetworkSocketProgress *progress = &g_network_socket_progress[fd];
+    if (!__atomic_load_n(&progress->active, __ATOMIC_ACQUIRE) ||
+        !__atomic_load_n(&progress->datagram, __ATOMIC_RELAXED))
+      continue;
+    ++out->tracked_datagram_sockets;
+    out->udp_recv_calls += __atomic_load_n(&progress->udp_receive_calls,
+                                           __ATOMIC_RELAXED);
+    out->udp_received_bytes += __atomic_load_n(&progress->udp_received_bytes,
+                                               __ATOMIC_RELAXED);
+    out->udp_send_calls += __atomic_load_n(&progress->udp_send_calls,
+                                           __ATOMIC_RELAXED);
+    out->udp_sent_bytes += __atomic_load_n(&progress->udp_sent_bytes,
+                                           __ATOMIC_RELAXED);
+    out->udp_receive_errors += __atomic_load_n(&progress->udp_receive_errors,
+                                               __ATOMIC_RELAXED);
+    const uint64_t dbytes = __atomic_load_n(&progress->udp_received_bytes,
+                                           __ATOMIC_RELAXED);
+    if (dbytes > out->largest_datagram_received_bytes)
+      out->largest_datagram_received_bytes = dbytes;
+    const uint64_t dlast = __atomic_load_n(&progress->last_receive_tick_ns,
+                                           __ATOMIC_RELAXED);
+    if (dlast > out->last_udp_receive_tick_ns)
+      out->last_udp_receive_tick_ns = dlast;
   }
 
   NxEpollDiagnostics epoll;
@@ -7630,6 +7797,33 @@ int setsockopt_fake(int s, int lv, int n, const void *v, unsigned l) {
     dontfrag = linux_pmtudisc == 2;
     v = &dontfrag;
     l = sizeof dontfrag;
+  }
+  /* Floor-clamp SO_RCVBUF so the guest cannot shrink a receive window below
+   * the promoted target.  The one-shot promotions in
+   * network_maybe_promote_receive_window / _datagram_window never re-fire,
+   * so a later setsockopt(SO_RCVBUF, small) from the game would collapse the
+   * window and cap bulk-download throughput (observed ~350 kbit/s).  The
+   * clamp is socket-type aware: streams use the long-stream target,
+   * datagrams (KCP) use the datagram target.  When the configured target is
+   * 0 (no promotion configured / control traffic), this is a no-op and the
+   * guest's value passes through unchanged. */
+  int rcvbuf_floor_value = 0;
+  if (L == SOL_SOCKET && N == SO_RCVBUF && v && l >= sizeof(int)) {
+    const int is_datagram = network_socket_is_datagram(s);
+    const uint32_t target = __atomic_load_n(
+      is_datagram ? &g_network_datagram_receive_window
+                  : &g_network_long_stream_receive_window,
+      __ATOMIC_RELAXED);
+    if (target > 0 && target <= (uint32_t)INT_MAX) {
+      int requested = *(const int *)v;
+      if ((uint32_t)requested < target) {
+        rcvbuf_floor_value = (int)target;
+        v = &rcvbuf_floor_value;
+        l = sizeof rcvbuf_floor_value;
+        if (is_datagram) NET_DIAG_ADD(datagram_window_attempts, 1);
+        else NET_DIAG_ADD(long_stream_window_attempts, 1);
+      }
+    }
   }
   int r = setsockopt(s, L, N, v, l); if (r < 0) NET_FAIL(); return r;
 }

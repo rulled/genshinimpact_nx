@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include "android_identity.h"
+#include "device_profile.h"
 #include "combo_bridge.h"
 #include "combo_session.h"
 #include "config.h"
@@ -605,9 +606,37 @@ static void secure_slist_free_all(struct curl_slist *headers) {
   curl_slist_free_all(headers);
 }
 
+/* x-rpc-* identity values use application/x-www-form-urlencoded encoding
+ * (space -> '+').  Harvested profiles store the raw value, so encode it
+ * here; models and OS labels never contain other reserved characters. */
+static void profile_header_encode(char *out, size_t capacity,
+                                  const char *value) {
+  size_t written = 0;
+  for (const char *c = value; *c && written + 1 < capacity; ++c) {
+    const char replacement = *c == ' ' ? '+' : *c;
+    out[written++] = replacement;
+  }
+  out[written] = '\0';
+}
+
 static struct curl_slist *passport_headers(const char *verify_header,
                                            const char *aigis_header) {
   const char *device_id = android_identity_android_id();
+  /* Harvested device profile (device_profile.h): risk control compares the
+   * Passport/Combo identity against the device the account previously
+   * played on, so a consistent real profile replaces the synthetic
+   * Nintendo+Switch one whenever the operator supplied one. */
+  char model_header[160], name_header[160], os_header[64];
+  profile_header_encode(model_header, sizeof model_header,
+                        device_profile_or("model", "Nintendo Switch"));
+  profile_header_encode(name_header, sizeof name_header,
+                        device_profile_or("device_name",
+                                          device_profile_or(
+                                            "model",
+                                            "Nintendo Switch")));
+  snprintf(os_header, sizeof os_header, "Android+%s",
+           device_profile_or("version_release", "12"));
+  const char *device_fp = device_profile_get("device_fp");
   struct curl_slist *headers = NULL;
   if (append_header(&headers, "Accept: application/json") ||
       append_header(&headers, "Content-Type: application/json; charset=UTF-8") ||
@@ -615,10 +644,12 @@ static struct curl_slist *passport_headers(const char *verify_header,
       append_header(&headers, "x-rpc-app_id: %s", PASSPORT_APP_ID) ||
       append_header(&headers, "x-rpc-app_version: %s", SS_VERSION_NAME) ||
       append_header(&headers, "x-rpc-device_id: %s", device_id) ||
-      append_header(&headers, "x-rpc-device_fp;") ||
-      append_header(&headers, "x-rpc-device_model: Nintendo+Switch") ||
-      append_header(&headers, "x-rpc-device_os: Android+12") ||
-      append_header(&headers, "x-rpc-device_name: Nintendo+Switch") ||
+      (device_fp
+         ? append_secret_header(&headers, "x-rpc-device_fp", device_fp)
+         : append_header(&headers, "x-rpc-device_fp;")) ||
+      append_header(&headers, "x-rpc-device_model: %s", model_header) ||
+      append_header(&headers, "x-rpc-device_os: %s", os_header) ||
+      append_header(&headers, "x-rpc-device_name: %s", name_header) ||
       append_header(&headers, "x-rpc-client_type: 2") ||
       append_header(&headers, "x-rpc-sdk_version: 2.3.0") ||
       append_header(&headers, "x-rpc-language: en-us") ||
@@ -654,19 +685,27 @@ static struct curl_slist *verifier_headers(void) {
 
 static struct curl_slist *combo_headers(void) {
   const char *device_id = android_identity_android_id();
+  char model_header[160], os_header[64];
+  profile_header_encode(model_header, sizeof model_header,
+                        device_profile_or("model", "Nintendo Switch"));
+  snprintf(os_header, sizeof os_header, "Android+%s",
+           device_profile_or("version_release", "12"));
+  const char *device_fp = device_profile_get("device_fp");
   struct curl_slist *headers = NULL;
   if (append_header(&headers, "Accept: application/json") ||
       append_header(&headers, "Content-Type: application/json; charset=UTF-8") ||
-      append_header(&headers, "x-rpc-sys_version: Android+12") ||
+      append_header(&headers, "x-rpc-sys_version: %s", os_header) ||
       append_header(&headers, "x-rpc-device_id: %s", device_id) ||
-      append_header(&headers, "x-rpc-device_model: Nintendo+Switch") ||
+      append_header(&headers, "x-rpc-device_model: %s", model_header) ||
       append_header(&headers, "x-rpc-client_type: 2") ||
       append_header(&headers, "x-rpc-language: en-us") ||
       append_header(&headers, "x-rpc-channel_version: 2.54.0") ||
       append_header(&headers, "x-rpc-mdk_version: 2.54.0") ||
       append_header(&headers, "x-rpc-game_biz: hk4e_global") ||
       append_header(&headers, "x-rpc-channel_id: 1") ||
-      append_header(&headers, "x-rpc-device_fp;") ||
+      (device_fp
+         ? append_secret_header(&headers, "x-rpc-device_fp", device_fp)
+         : append_header(&headers, "x-rpc-device_fp;")) ||
       append_header(&headers, "x-rpc-lifecycle_id: %s", g_lifecycle_id) ||
       append_header(&headers, "x-rpc-app_id: %s", PASSPORT_APP_ID) ||
       append_header(&headers, "x-rpc-combo_version: 2.54.0") ||
