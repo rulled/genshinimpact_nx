@@ -725,8 +725,6 @@ _Static_assert(offsetof(NxFsdevFile, flags) == sizeof(FsFile),
                "libnx fsdev flags follow FsFile");
 
 #define NX_FS_TRANSFER_PAGE 0x10000u
-#define NX_FS_BULK_THRESHOLD (UINT64_C(1) << 20)
-#define NX_FS_BULK_EXTENT    (UINT64_C(1) << 20)
 #define NX_FS_TRACKED_FILES 128u
 #define NX_FS_TRACKED_PATH  600u
 
@@ -793,10 +791,12 @@ void nx_file_io_get_diagnostics(NxFileIoDiagnostics *out) {
   FILE_IO_LOAD(read_failures);
   FILE_IO_LOAD(write_calls);
   FILE_IO_LOAD(write_bytes);
+  FILE_IO_LOAD(write_failures);
   FILE_IO_LOAD(size_queries);
   FILE_IO_LOAD(size_cache_hits);
   FILE_IO_LOAD(size_query_failures);
   FILE_IO_LOAD(size_extensions);
+  FILE_IO_LOAD(size_extension_failures);
   FILE_IO_LOAD(preallocation_extensions);
   FILE_IO_LOAD(preallocation_fallbacks);
   FILE_IO_LOAD(preallocated_bytes);
@@ -945,6 +945,7 @@ static int nx_file_io_prepare_write(NxFsdevFile *file, uint64_t end) {
     }
     if (end <= (uint64_t)current_size) return 0;
     if (R_FAILED(fsFileSetSize(&file->file, (int64_t)end))) {
+      FILE_IO_ADD(size_extension_failures, 1);
       errno = EIO;
       return -1;
     }
@@ -969,13 +970,10 @@ static int nx_file_io_prepare_write(NxFsdevFile *file, uint64_t end) {
     FILE_IO_ADD(size_cache_hits, 1);
   }
 
-  uint64_t target = end;
-  if (entry->bulk_eligible && !(file->flags & O_SYNC) &&
-      end > (uint64_t)entry->logical_size &&
-      end >= NX_FS_BULK_THRESHOLD &&
-      end <= (uint64_t)INT64_MAX - (NX_FS_BULK_EXTENT - 1u)) {
-    target = (end + NX_FS_BULK_EXTENT - 1u) & ~(NX_FS_BULK_EXTENT - 1u);
-  }
+  /* Extend only to the requested logical end.  Speculative 1 MiB extents
+   * made interrupted FAT32 downloads harder to diagnose and widened the
+   * amount of metadata left in flight without improving write correctness. */
+  const uint64_t target = end;
   if (end > (uint64_t)entry->logical_size)
     entry->logical_size = (int64_t)end;
 
@@ -983,14 +981,8 @@ static int nx_file_io_prepare_write(NxFsdevFile *file, uint64_t end) {
     nx_file_size_operation_begin(entry, NX_FILE_SIZE_OP_EXTEND);
     Result result = fsFileSetSize(&file->file, (int64_t)target);
     nx_file_size_operation_end(entry);
-    if (R_FAILED(result) && target != end) {
-      FILE_IO_ADD(preallocation_fallbacks, 1);
-      target = end;
-      nx_file_size_operation_begin(entry, NX_FILE_SIZE_OP_FALLBACK);
-      result = fsFileSetSize(&file->file, (int64_t)target);
-      nx_file_size_operation_end(entry);
-    }
     if (R_FAILED(result)) {
+      FILE_IO_ADD(size_extension_failures, 1);
       /* Match ordinary pwrite extension semantics: a failed extension must
        * not leave the logical view beyond the last physical byte. */
       if (entry->logical_size > entry->physical_size)
@@ -1177,7 +1169,10 @@ static long nx_fsdev_pwrite(NxFsdevFile *file, const void *buffer,
                             size_t count, int64_t offset) {
   FILE_IO_ADD(write_calls, 1);
   const uint64_t end = (uint64_t)offset + (uint64_t)count;
-  if (nx_file_io_prepare_write(file, end) != 0) return -1;
+  if (nx_file_io_prepare_write(file, end) != 0) {
+    FILE_IO_ADD(write_failures, 1);
+    return -1;
+  }
   Result result;
   /* The Android image passes Unity mmap-backed buffers which Horizon FS does
    * not accept as IPC transfer memory.  Probe until the first rejection, then
@@ -1189,6 +1184,7 @@ static long nx_fsdev_pwrite(NxFsdevFile *file, const void *buffer,
       FILE_IO_ADD(direct_writes, 1);
       FILE_IO_ADD(write_bytes, count);
       if ((file->flags & O_SYNC) && R_FAILED(fsFileFlush(&file->file))) {
+        FILE_IO_ADD(write_failures, 1);
         errno = EIO;
         return -1;
       }
@@ -1200,6 +1196,7 @@ static long nx_fsdev_pwrite(NxFsdevFile *file, const void *buffer,
 
   unsigned char *page = nx_fs_transfer_page();
   if (!page) {
+    FILE_IO_ADD(write_failures, 1);
     errno = ENOMEM;
     return -1;
   }
@@ -1211,7 +1208,10 @@ static long nx_fsdev_pwrite(NxFsdevFile *file, const void *buffer,
     result = fsFileWrite(&file->file, offset + (int64_t)done, page, wanted,
                          FsWriteOption_None);
     if (R_FAILED(result)) {
+      FILE_IO_ADD(write_failures, 1);
       if (done) {
+        FILE_IO_ADD(write_bytes, done);
+        FILE_IO_ADD(bounce_bytes, done);
         if ((file->flags & O_SYNC) && R_FAILED(fsFileFlush(&file->file))) {
           errno = EIO;
           return -1;
@@ -1227,6 +1227,7 @@ static long nx_fsdev_pwrite(NxFsdevFile *file, const void *buffer,
   FILE_IO_ADD(bounce_bytes, done);
   FILE_IO_ADD(write_bytes, done);
   if ((file->flags & O_SYNC) && R_FAILED(fsFileFlush(&file->file))) {
+    FILE_IO_ADD(write_failures, 1);
     errno = EIO;
     return -1;
   }

@@ -2738,6 +2738,25 @@ int main(int argc, char **argv) {
                 fio.oldest_size_operation_kind,
                 (unsigned long long)fio.finalize_calls,
                 (unsigned long long)fio.finalize_failures);
+        fprintf(lf,
+                "[I] fio: rd=%lluB/%llu fail=%llu wr=%lluB/%llu fail=%llu "
+                "size=q%llu/h%llu/qfail%llu/ext%llu/efail%llu "
+                "direct=%llu/%llu bounce=%lluB/%llu\n",
+                (unsigned long long)fio.read_bytes,
+                (unsigned long long)fio.read_calls,
+                (unsigned long long)fio.read_failures,
+                (unsigned long long)fio.write_bytes,
+                (unsigned long long)fio.write_calls,
+                (unsigned long long)fio.write_failures,
+                (unsigned long long)fio.size_queries,
+                (unsigned long long)fio.size_cache_hits,
+                (unsigned long long)fio.size_query_failures,
+                (unsigned long long)fio.size_extensions,
+                (unsigned long long)fio.size_extension_failures,
+                (unsigned long long)fio.direct_writes,
+                (unsigned long long)fio.direct_write_failures,
+                (unsigned long long)fio.bounce_bytes,
+                (unsigned long long)fio.bounce_writes);
         fclose(lf);
       }
     }

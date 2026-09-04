@@ -104,10 +104,12 @@ typedef struct {
   uint64_t read_failures;
   uint64_t write_calls;
   uint64_t write_bytes;
+  uint64_t write_failures;
   uint64_t size_queries;
   uint64_t size_cache_hits;
   uint64_t size_query_failures;
   uint64_t size_extensions;
+  uint64_t size_extension_failures;
   uint64_t preallocation_extensions;
   uint64_t preallocation_fallbacks;
   uint64_t preallocated_bytes;
