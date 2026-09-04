@@ -429,6 +429,15 @@ typedef struct {
   uint64_t long_stream_window_failures;
   int32_t last_long_stream_window_error;
   uint64_t last_long_stream_window_effective;
+  /* Datagram receive-window promotion (KCP/UDP bulk download).  Mirrors the
+   * stream fields: att/ok/fail count one-shot SO_RCVBUF promotions per
+   * datagram socket, eff is the effective window the BSD service granted. */
+  uint64_t datagram_receive_window_target;
+  uint64_t datagram_window_attempts;
+  uint64_t datagram_window_successes;
+  uint64_t datagram_window_failures;
+  int32_t last_datagram_window_error;
+  uint64_t last_datagram_window_effective;
   uint64_t tracked_stream_sockets;
   uint64_t receiving_stream_sockets;
   uint64_t stalled_stream_sockets;
@@ -489,7 +498,9 @@ typedef struct {
 
 int network_get_transport_diagnostics(NetworkTransportDiagnostics *out);
 void network_configure_long_stream_receive_window(uint32_t initial_size,
-                                                   uint32_t maximum_size);
+                                                  uint32_t maximum_size);
+void network_configure_datagram_receive_window(uint32_t initial_size,
+                                               uint32_t maximum_size);
 void network_track_duplicate(int source, int target);
 int socket_fake(int d, int t, int p);
 int connect_fake(int s, const void *a, unsigned l);

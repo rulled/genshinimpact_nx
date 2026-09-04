@@ -5348,6 +5348,7 @@ typedef struct {
   uint32_t stream;
   uint32_t datagram;
   uint32_t receive_window_state; /* 0=pending, 1=setting, 2=set, 3=failed */
+  uint32_t udp_receive_window_state; /* 0=pending, 1=setting, 2=set, 3=failed */
   uint32_t recv_inflight;
   uint32_t readiness_probe_state; /* 0=none/consumed, 1=valid, 2=failed */
   uint32_t udp_send_route_state; /* 0=unknown, 1=retain name, 2=connected peer */
@@ -5374,6 +5375,7 @@ typedef struct {
 static NetworkSocketProgress g_network_socket_progress[NETWORK_TRACKED_FD_LIMIT];
 static uint64_t g_network_socket_generation;
 static uint32_t g_network_long_stream_receive_window;
+static uint32_t g_network_datagram_receive_window;
 
 static int network_socket_is_datagram(int fd) {
   if (fd < 0 || fd >= NETWORK_TRACKED_FD_LIMIT) return 0;
@@ -5447,6 +5449,10 @@ static int network_udp_destination_is_connected_peer(
   return route_state == 2;
 }
 
+static void network_maybe_promote_datagram_window(int fd,
+                                                  NetworkSocketProgress *progress,
+                                                  uint64_t received_bytes);
+
 static void network_udp_record_send(int fd, long result) {
   if (!network_socket_is_datagram(fd)) return;
   NetworkSocketProgress *progress = &g_network_socket_progress[fd];
@@ -5476,9 +5482,17 @@ static void network_udp_record_receive(int fd, long result) {
 
     return;
   }
-  __atomic_fetch_add(&progress->udp_received_bytes, (uint64_t)result,
-                     __ATOMIC_RELAXED);
+  /* The KCP receive queue drains in bursts; the default Horizon datagram
+   * buffer is small enough that a burst plus any il2cpp GC pause overflows
+   * it, and the resulting silent loss collapses KCP into retransmit
+   * backoff.  Promote the datagram receive window once bulk traffic is
+   * confirmed, mirroring the stream promotion below. */
+  const uint64_t received_total = __atomic_add_fetch(
+    &progress->udp_received_bytes, (uint64_t)result, __ATOMIC_RELAXED);
+  __atomic_store_n(&progress->last_receive_tick_ns,
+                   armTicksToNs(armGetSystemTick()), __ATOMIC_RELAXED);
   __atomic_store_n(&progress->udp_last_receive_error, 0, __ATOMIC_RELAXED);
+  network_maybe_promote_datagram_window(fd, progress, received_total);
 }
 
 static void network_track_open(int fd, int native_type) {
@@ -5491,6 +5505,7 @@ static void network_track_open(int fd, int native_type) {
   __atomic_store_n(&progress->datagram, native_type == SOCK_DGRAM,
                    __ATOMIC_RELAXED);
   __atomic_store_n(&progress->receive_window_state, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&progress->udp_receive_window_state, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&progress->recv_inflight, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&progress->readiness_probe_state, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&progress->udp_send_route_state, 0, __ATOMIC_RELAXED);
@@ -5767,6 +5782,23 @@ void network_configure_long_stream_receive_window(uint32_t initial_size,
   NET_DIAG_STORE(long_stream_receive_window_target, target);
 }
 
+void network_configure_datagram_receive_window(uint32_t initial_size,
+                                               uint32_t maximum_size) {
+  /* Horizon's BSD config has no udp max field, so the datagram receive
+   * queue cannot grow past socketInitialize's reservation at runtime.
+   * main.c passes the TCP max as the ceiling: when the enlarged
+   * udp_rx_buf_size reservation was accepted the two match and the
+   * runtime promotion stays disabled (target 0); when the reservation
+   * fell back to the small default the promotion at least tries and the
+   * telemetry records the effective window the service granted. */
+  const uint32_t target = maximum_size > initial_size &&
+                          maximum_size <= (uint32_t)INT_MAX
+    ? maximum_size : 0;
+  __atomic_store_n(&g_network_datagram_receive_window, target,
+                   __ATOMIC_RELAXED);
+  NET_DIAG_STORE(datagram_receive_window_target, target);
+}
+
 static void network_maybe_promote_receive_window(
     int fd, NetworkSocketProgress *progress, uint64_t received_bytes) {
   if (!progress || received_bytes < NETWORK_BULK_MIN_BYTES) return;
@@ -5803,6 +5835,47 @@ static void network_maybe_promote_receive_window(
     NET_DIAG_ADD(long_stream_window_failures, 1);
     NET_DIAG_STORE(last_long_stream_window_error, n2b_errno(option_error));
     __atomic_store_n(&progress->receive_window_state, 3, __ATOMIC_RELEASE);
+  }
+}
+
+static void network_maybe_promote_datagram_window(
+    int fd, NetworkSocketProgress *progress, uint64_t received_bytes) {
+  if (!progress || received_bytes < NETWORK_BULK_MIN_BYTES) return;
+  const uint32_t target = __atomic_load_n(
+    &g_network_datagram_receive_window, __ATOMIC_RELAXED);
+  if (!target) return;
+  uint32_t expected = 0;
+  if (!__atomic_compare_exchange_n(&progress->udp_receive_window_state,
+                                    &expected, 1, false,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+    return;
+
+  NET_DIAG_ADD(datagram_window_attempts, 1);
+  const int saved_errno = errno;
+  const int requested = (int)target;
+  const int result = setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                                &requested, sizeof requested);
+  const int option_error = result < 0 ? errno : 0;
+  int effective = 0;
+  socklen_t effective_size = sizeof effective;
+  if (result == 0 &&
+      getsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                 &effective, &effective_size) < 0)
+    effective = requested;
+  errno = saved_errno;
+
+  if (result == 0) {
+    NET_DIAG_ADD(datagram_window_successes, 1);
+    NET_DIAG_STORE(last_datagram_window_error, 0);
+    NET_DIAG_STORE(last_datagram_window_effective,
+                   effective > 0 ? (uint64_t)effective : target);
+    __atomic_store_n(&progress->udp_receive_window_state, 2,
+                     __ATOMIC_RELEASE);
+  } else {
+    NET_DIAG_ADD(datagram_window_failures, 1);
+    NET_DIAG_STORE(last_datagram_window_error, n2b_errno(option_error));
+    __atomic_store_n(&progress->udp_receive_window_state, 3,
+                     __ATOMIC_RELEASE);
   }
 }
 
@@ -5899,6 +5972,12 @@ int network_get_transport_diagnostics(NetworkTransportDiagnostics *out) {
   NET_DIAG_LOAD(long_stream_window_failures);
   NET_DIAG_LOAD(last_long_stream_window_error);
   NET_DIAG_LOAD(last_long_stream_window_effective);
+  NET_DIAG_LOAD(datagram_receive_window_target);
+  NET_DIAG_LOAD(datagram_window_attempts);
+  NET_DIAG_LOAD(datagram_window_successes);
+  NET_DIAG_LOAD(datagram_window_failures);
+  NET_DIAG_LOAD(last_datagram_window_error);
+  NET_DIAG_LOAD(last_datagram_window_effective);
   NET_DIAG_LOAD(poll_readiness_probes);
   NET_DIAG_LOAD(poll_readiness_hits);
   NET_DIAG_LOAD(poll_readiness_probe_failures);
@@ -7684,24 +7763,30 @@ int setsockopt_fake(int s, int lv, int n, const void *v, unsigned l) {
     v = &dontfrag;
     l = sizeof dontfrag;
   }
-  /* Floor-clamp SO_RCVBUF so the guest cannot shrink the TCP receive window
-   * below the promoted long-stream target.  The one-shot promotion in
-   * network_maybe_promote_receive_window never re-fires, so a later
-   * setsockopt(SO_RCVBUF, small) from the game would collapse the window
-   * and cap bulk-download throughput (observed ~350 kbit/s).  When the
-   * configured target is 0 (no promotion configured / control traffic),
-   * this is a no-op and the guest's value passes through unchanged. */
+  /* Floor-clamp SO_RCVBUF so the guest cannot shrink a receive window below
+   * the promoted target.  The one-shot promotions in
+   * network_maybe_promote_receive_window / _datagram_window never re-fire,
+   * so a later setsockopt(SO_RCVBUF, small) from the game would collapse the
+   * window and cap bulk-download throughput (observed ~350 kbit/s).  The
+   * clamp is socket-type aware: streams use the long-stream target,
+   * datagrams (KCP) use the datagram target.  When the configured target is
+   * 0 (no promotion configured / control traffic), this is a no-op and the
+   * guest's value passes through unchanged. */
   int rcvbuf_floor_value = 0;
   if (L == SOL_SOCKET && N == SO_RCVBUF && v && l >= sizeof(int)) {
+    const int is_datagram = network_socket_is_datagram(s);
     const uint32_t target = __atomic_load_n(
-      &g_network_long_stream_receive_window, __ATOMIC_RELAXED);
+      is_datagram ? &g_network_datagram_receive_window
+                  : &g_network_long_stream_receive_window,
+      __ATOMIC_RELAXED);
     if (target > 0 && target <= (uint32_t)INT_MAX) {
       int requested = *(const int *)v;
       if ((uint32_t)requested < target) {
         rcvbuf_floor_value = (int)target;
         v = &rcvbuf_floor_value;
         l = sizeof rcvbuf_floor_value;
-        NET_DIAG_ADD(long_stream_window_attempts, 1);
+        if (is_datagram) NET_DIAG_ADD(datagram_window_attempts, 1);
+        else NET_DIAG_ADD(long_stream_window_attempts, 1);
       }
     }
   }

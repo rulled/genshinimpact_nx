@@ -44,6 +44,12 @@
 #define STARTUP_METADATA_SIZE ((size_t)3932952)
 #define STARTUP_METADATA_MAP_SIZE ((size_t)0x3c1000)
 #define NETWORK_BSD_SESSION_COUNT 16u
+/* KCP bulk download rides on UDP datagrams.  libnx reserves datagram
+ * receive queues up front (there is no udp max growth field), so the only
+ * way to enlarge them is a bigger udp_rx_buf_size at socketInitialize.
+ * The BSD service rejects oversized reservations; main() falls back to the
+ * hardware-proven default tuple in that case. */
+#define NETWORK_UDP_RX_BUF_CANDIDATE 0x40000u
 
 void unity_environment_init(const char *data_root); /* unity_glue.c */
 
@@ -2364,17 +2370,34 @@ int main(int argc, char **argv) {
   const Result nifm_result = nifmInitialize(NifmServiceType_User);
   nifm_started = R_SUCCEEDED(nifm_result);
   /* Unity performs networking from many workers.  Raise only the BSD IPC
-   * session count: this exact default-buffer/16-session tuple reached the
-   * installer and sustained the first large resource transfer on hardware.
-   * Oversized per-socket buffers later stalled post-login server dispatch. */
+   * session count and the datagram receive queue: this exact
+   * default-TCP-buffer/16-session tuple reached the installer and
+   * sustained the first large resource transfer on hardware.  Oversized
+   * TCP per-socket buffers later stalled post-login server dispatch, so
+   * TCP sizes stay at the defaults; UDP only carries the KCP download,
+   * which the small default queue (0xA500) overflows under bursts. */
   SocketInitConfig socket_config = *socketGetDefaultInitConfig();
   socket_config.num_bsd_sessions = NETWORK_BSD_SESSION_COUNT;
-  const Result socket_result = socketInitialize(&socket_config);
+  const uint32_t default_udp_rx_buf_size = socket_config.udp_rx_buf_size;
+  socket_config.udp_rx_buf_size = NETWORK_UDP_RX_BUF_CANDIDATE;
+  Result socket_result = socketInitialize(&socket_config);
+  if (R_FAILED(socket_result) &&
+      socket_config.udp_rx_buf_size != default_udp_rx_buf_size) {
+    /* socketInitialize already cleaned up its partial state on failure. */
+    socket_config.udp_rx_buf_size = default_udp_rx_buf_size;
+    socket_result = socketInitialize(&socket_config);
+  }
+  const uint32_t effective_udp_rx_buf_size = socket_config.udp_rx_buf_size;
+  const uint32_t configured_udp_rx_max =
+    socket_config.tcp_rx_buf_max_size; /* datagram promotion ceiling */
   socket_started = R_SUCCEEDED(socket_result);
   g_net_on = socket_started;
   network_configure_long_stream_receive_window(
     socket_started ? socket_config.tcp_rx_buf_size : 0,
     socket_started ? socket_config.tcp_rx_buf_max_size : 0);
+  network_configure_datagram_receive_window(
+    socket_started ? effective_udp_rx_buf_size : 0,
+    socket_started ? configured_udp_rx_max : 0);
 
   if (!socket_started)
     fatal_error("Nintendo Switch socket services could not be initialized.");
@@ -2631,13 +2654,16 @@ int main(int argc, char **argv) {
                 diag.dynamic_mapped_bytes / MiB,
                 (unsigned long long)diag.backing_unmap_ok,
                 (unsigned long long)diag.backing_unmap_fail);
-        /* Network transport telemetry.  received_bytes/recv_calls expose
-         * throughput; long_stream_window_* show whether the SO_RCVBUF
-         * promotion fired and what effective window each bulk stream got.
-         * Without this the ~350 kbit/s download cap was unobservable. */
+        /* Network transport telemetry.  rxall counts payload from BOTH the
+         * TCP and UDP paths (the counter is fed by every bionic recv
+         * variant), so bulk KCP traffic is included here as well; the
+         * dedicated net-udp line below separates it.  long_stream_window_*
+         * show whether the stream SO_RCVBUF promotion fired and what
+         * effective window each bulk stream got.  Without this the ~350
+         * kbit/s download cap was unobservable. */
         const unsigned long long KiB = 1024ull;
         fprintf(lf,
-                "[I] net: recv=%lluB/%llu rxfail=%llu wblock=%llu "
+                "[I] net: rxall=%lluB/%llu rxfail=%llu wblock=%llu "
                 "rcvbuf win att=%llu ok=%llu fail=%llu eff=%lluB "
                 "largest=%lluB streams=%llu/%llu\n",
                 (unsigned long long)net.received_bytes,
@@ -2661,14 +2687,20 @@ int main(int argc, char **argv) {
          * cap. */
         fprintf(lf,
                 "[I] net-udp: recv=%lluB/%llu sent=%lluB/%llu "
-                "rxfail=%llu dgram=%llu largest=%lluB\n",
+                "rxfail=%llu dgram=%llu largest=%lluB "
+                "win att=%llu ok=%llu fail=%llu eff=%lluB tgt=%lluB\n",
                 (unsigned long long)net.udp_received_bytes,
                 (unsigned long long)net.udp_recv_calls,
                 (unsigned long long)net.udp_sent_bytes,
                 (unsigned long long)net.udp_send_calls,
                 (unsigned long long)net.udp_receive_errors,
                 (unsigned long long)net.tracked_datagram_sockets,
-                (unsigned long long)net.largest_datagram_received_bytes);
+                (unsigned long long)net.largest_datagram_received_bytes,
+                (unsigned long long)net.datagram_window_attempts,
+                (unsigned long long)net.datagram_window_successes,
+                (unsigned long long)net.datagram_window_failures,
+                (unsigned long long)net.last_datagram_window_effective,
+                (unsigned long long)net.datagram_receive_window_target);
         (void)KiB;
         /* Donor headroom + file-IO trim-stall telemetry.  During the download
          * verification phase (~50GB of .blk hashed at once) the heap-donor pool

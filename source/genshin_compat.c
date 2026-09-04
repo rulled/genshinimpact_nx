@@ -1,6 +1,7 @@
 /* Additional Bionic/Linux ABI required by Genshin's merged Unity player. */
 
 #include <stdlib.h>
+#include <malloc.h>
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
@@ -732,6 +733,18 @@ _Static_assert(offsetof(NxFsdevFile, flags) == sizeof(FsFile),
 static NxFileIoDiagnostics g_file_io_diagnostics;
 static uint32_t g_fs_write_requires_bounce;
 
+/* The direct-transfer fallbacks bounce through one page-sized buffer.
+ * Guest worker threads can run on small stacks, so a 64 KiB stack array is
+ * a silent overflow hazard; keep one page-aligned buffer per thread
+ * instead (the FS IPC write path requires 0x1000 alignment).  Allocation
+ * failure leaves the errno ENOMEM path, matching a full transfer arena. */
+static unsigned char *nx_fs_transfer_page(void) {
+  static __thread unsigned char *tls_page;
+  if (!tls_page)
+    tls_page = memalign(0x1000, NX_FS_TRANSFER_PAGE);
+  return tls_page;
+}
+
 typedef struct {
   Mutex lock;
   NxFsdevFile *file;
@@ -1129,13 +1142,18 @@ static long nx_fsdev_pread(NxFsdevFile *file, void *buffer, size_t count,
   }
 
   /* Retry every direct-transfer rejection, plus an anomalous zero-byte read
-   * before EOF, through a stack buffer.  Different FS/libnx revisions can
+   * before EOF, through a bounce page.  Different FS/libnx revisions can
    * report inaccessible mapped-buffer classes with different Result values. */
-  unsigned char page[NX_FS_TRANSFER_PAGE];
+  unsigned char *page = nx_fs_transfer_page();
+  if (!page) {
+    FILE_IO_ADD(read_failures, 1);
+    errno = ENOMEM;
+    return -1;
+  }
   size_t done = 0;
   while (done < count) {
-    const size_t wanted = count - done < sizeof(page)
-      ? count - done : sizeof(page);
+    const size_t wanted = count - done < NX_FS_TRANSFER_PAGE
+      ? count - done : NX_FS_TRANSFER_PAGE;
     bytes = 0;
     result = fsFileRead(&file->file, offset + (int64_t)done, page, wanted,
                         FsReadOption_None, &bytes);
@@ -1180,11 +1198,15 @@ static long nx_fsdev_pwrite(NxFsdevFile *file, const void *buffer,
     __atomic_store_n(&g_fs_write_requires_bounce, 1, __ATOMIC_RELAXED);
   }
 
-  unsigned char page[NX_FS_TRANSFER_PAGE] __attribute__((aligned(0x1000)));
+  unsigned char *page = nx_fs_transfer_page();
+  if (!page) {
+    errno = ENOMEM;
+    return -1;
+  }
   size_t done = 0;
   while (done < count) {
-    const size_t wanted = count - done < sizeof(page)
-      ? count - done : sizeof(page);
+    const size_t wanted = count - done < NX_FS_TRANSFER_PAGE
+      ? count - done : NX_FS_TRANSFER_PAGE;
     memcpy(page, (const unsigned char *)buffer + done, wanted);
     result = fsFileWrite(&file->file, offset + (int64_t)done, page, wanted,
                          FsWriteOption_None);
