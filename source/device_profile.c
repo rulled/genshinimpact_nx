@@ -1,5 +1,8 @@
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "device_profile.h"
@@ -8,6 +11,7 @@
 #define PROFILE_MAX_ENTRIES 32u
 #define PROFILE_KEY_MAX 31u
 #define PROFILE_VALUE_MAX 127u
+#define ANDROID_PROPERTY_VALUE_MAX 91u
 
 typedef struct {
   char key[PROFILE_KEY_MAX + 1];
@@ -25,8 +29,35 @@ static char *trim(char *text) {
   return text;
 }
 
+static int profile_key_is_android_property(const char *key) {
+  static const char *const keys[] = {
+    "model", "device_name", "manufacturer", "brand", "product", "device",
+    "board", "hardware", "platform", "fingerprint", "build_id",
+    "display_id", "build_host", "build_user", "characteristics",
+    "version_release", "version_sdk", "security_patch", "incremental",
+  };
+  for (size_t i = 0; i < sizeof keys / sizeof keys[0]; ++i)
+    if (!strcmp(key, keys[i])) return 1;
+  return 0;
+}
+
+static int profile_key_valid(const char *key) {
+  return profile_key_is_android_property(key) ||
+         !strcmp(key, "android_id") || !strcmp(key, "device_fp");
+}
+
 static int profile_value_valid(const char *key, const char *value) {
-  if (!*key || !*value) return 0;
+  if (!*key || !*value || !profile_key_valid(key)) return 0;
+  if (profile_key_is_android_property(key) &&
+      strlen(value) > ANDROID_PROPERTY_VALUE_MAX)
+    return 0;
+  if (!strcmp(key, "version_sdk")) {
+    char *end = NULL;
+    errno = 0;
+    const long sdk = strtol(value, &end, 10);
+    if (errno == ERANGE || end == value || *end || sdk <= 0 || sdk > INT_MAX)
+      return 0;
+  }
   if (!strcmp(key, "android_id")) {
     if (strlen(value) != 16) return 0;
     for (const char *c = value; *c; ++c) {

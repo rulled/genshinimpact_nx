@@ -96,11 +96,16 @@ static FakePropInfo system_properties[] = {
   { "ro.build.version.sdk", "33" },
   { "ro.build.version.release", "13" },
   { "ro.build.version.codename", "REL" },
+  { "ro.build.id", "REL" },
+  { "ro.build.display.id", "REL" },
+  { "ro.build.host", "localhost" },
+  { "ro.build.user", "nx" },
   { "ro.product.cpu.abi", "arm64-v8a" },
   { "ro.product.cpu.abilist", "arm64-v8a" },
   { "ro.product.cpu.abilist64", "arm64-v8a" },
   { "ro.product.cpu.abi2", "" },
   { "ro.product.model", "Switch" },
+  { "ro.product.marketname", "Nintendo Switch" },
   { "ro.product.manufacturer", "Nintendo" },
   { "ro.product.brand", "Nintendo" },
   { "ro.product.name", "Switch" },
@@ -109,6 +114,8 @@ static FakePropInfo system_properties[] = {
   { "ro.hardware", "nx" },
   { "ro.board.platform", "nx" },
   { "ro.build.fingerprint", "Nintendo/Switch/Switch:13/REL/10007:user/release-keys" },
+  { "ro.build.version.incremental", "10007" },
+  { "ro.build.version.security_patch", "2023-01-01" },
   { "ro.build.characteristics", "default" },
   { "ro.build.type", "user" },
   { "ro.build.tags", "release-keys" },
@@ -118,6 +125,7 @@ static FakePropInfo system_properties[] = {
   { "ro.opengles.version", "196610" }, /* GLES 3.2 */
   { "dalvik.vm.heapsize", "512m" },
   { "persist.sys.timezone", "UTC" },
+  { "persist.sys.device_name", "Nintendo Switch" },
 };
 static const FakePropInfo *find_system_property(const char *name) {
   if (!name) return NULL;
@@ -151,6 +159,8 @@ void libc_shim_apply_device_profile(void) {
     const char *prop;
   } map[] = {
     { "model", "ro.product.model" },
+    { "device_name", "ro.product.marketname" },
+    { "device_name", "persist.sys.device_name" },
     { "manufacturer", "ro.product.manufacturer" },
     { "brand", "ro.product.brand" },
     { "product", "ro.product.name" },
@@ -159,8 +169,15 @@ void libc_shim_apply_device_profile(void) {
     { "hardware", "ro.hardware" },
     { "platform", "ro.board.platform" },
     { "fingerprint", "ro.build.fingerprint" },
+    { "build_id", "ro.build.id" },
+    { "display_id", "ro.build.display.id" },
+    { "build_host", "ro.build.host" },
+    { "build_user", "ro.build.user" },
+    { "characteristics", "ro.build.characteristics" },
     { "version_release", "ro.build.version.release" },
     { "version_sdk", "ro.build.version.sdk" },
+    { "security_patch", "ro.build.version.security_patch" },
+    { "incremental", "ro.build.version.incremental" },
   };
   for (size_t m = 0; m < sizeof map / sizeof map[0]; ++m) {
     const char *value = device_profile_get(map[m].key);

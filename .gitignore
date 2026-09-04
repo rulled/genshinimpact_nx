@@ -15,3 +15,6 @@ symbols.txt
 .build-tmp/
 build/
 sd_bundle/
+
+# Generated from a physical Android device; may contain identifying values.
+tools/device_profile.ini

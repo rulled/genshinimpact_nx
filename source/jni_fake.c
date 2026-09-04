@@ -5,6 +5,7 @@
  */
 
 #include <stdlib.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -1024,7 +1025,8 @@ static void *act_object(void *recv, const FakeID *id, va_list va) {
     return intern_class("java/lang/Object");
   if (name_has(id->name, "VersionName")) return jni_make_string(SS_VERSION_NAME);
   if (name_has(id->name, "PackageName")) return jni_make_string(SS_PACKAGE);
-  if (name_has(id->name, "DeviceModel")) return jni_make_string("Switch");
+  if (name_has(id->name, "DeviceModel"))
+    return jni_make_string(device_profile_or("model", "Switch"));
   if (name_has(id->cls,"java/lang/System") && name_has(id->name,"getProperty"))
     return system_property_value(jni_string_utf(va_arg(va,void*)));
   if (name_has(id->name, "getProperty"))
@@ -2147,7 +2149,16 @@ static void j_SetPriArrayRegion(void *env, void *arr, int start, int len, const 
 
 #define APP_VERSION_NAME SS_VERSION_NAME
 #define APP_VERSION_CODE SS_VERSION_CODE
-#define NX_SDK_INT       33
+
+static juint device_sdk_int(void) {
+  const char *value = device_profile_get("version_sdk");
+  if (!value) return 33;
+  char *end = NULL;
+  errno = 0;
+  const long sdk = strtol(value, &end, 10);
+  return errno != ERANGE && end != value && !*end && sdk > 0 && sdk <= INT_MAX
+    ? (juint)sdk : 33;
+}
 
 static void *field_object(const FakeID *id) {
   const char *n = id->name, *c = id->cls;
@@ -2166,7 +2177,8 @@ static void *field_object(const FakeID *id) {
   /* UnityPlayer.currentActivity must be non-null. */
   if (name_has(c, "unity3d/player/UnityPlayer")) {
     if (!strcmp(n, "currentActivity")) return jni_make_object("android/app/Activity");
-    if (!strcmp(n, "MANUFACTURER"))    return jni_make_string("Nintendo");
+    if (!strcmp(n, "MANUFACTURER"))
+      return jni_make_string(device_profile_or("manufacturer", "Nintendo"));
   }
   /* AudioManager output properties consumed by CRIWARE. */
   if (name_has(c, "media/AudioManager")) {
@@ -2199,14 +2211,15 @@ static void *field_object(const FakeID *id) {
     if (!strcmp(n, "PRODUCT"))      return jni_make_string(device_profile_or("product", "Switch"));
     if (!strcmp(n, "HARDWARE"))     return jni_make_string(device_profile_or("hardware", "nx"));
     if (!strcmp(n, "BOARD"))        return jni_make_string(device_profile_or("board", "nx"));
-    if (!strcmp(n, "DISPLAY"))      return jni_make_string(device_profile_or("incremental", "nx"));
-    if (!strcmp(n, "ID"))           return jni_make_string("REL");
+    if (!strcmp(n, "DISPLAY"))      return jni_make_string(device_profile_or("display_id", "REL"));
+    if (!strcmp(n, "ID"))           return jni_make_string(device_profile_or("build_id", "REL"));
     if (!strcmp(n, "TYPE"))         return jni_make_string("user");
     if (!strcmp(n, "TAGS"))         return jni_make_string("release-keys");
+    if (!strcmp(n, "CHARACTERISTICS")) return jni_make_string(device_profile_or("characteristics", "default"));
     if (!strcmp(n, "FINGERPRINT"))  return jni_make_string(device_profile_or("fingerprint", "Nintendo/Switch/Switch:13/REL/10007:user/release-keys"));
     if (!strcmp(n, "BOOTLOADER"))   return jni_make_string("unknown");
-    if (!strcmp(n, "HOST"))         return jni_make_string("localhost");
-    if (!strcmp(n, "USER"))         return jni_make_string("nx");
+    if (!strcmp(n, "HOST"))         return jni_make_string(device_profile_or("build_host", "localhost"));
+    if (!strcmp(n, "USER"))         return jni_make_string(device_profile_or("build_user", "nx"));
     if (!strcmp(n, "SERIAL"))       return jni_make_string("unknown");
     if (!strcmp(n, "RELEASE"))      return jni_make_string(device_profile_or("version_release", "13"));        /* Build.VERSION.* */
     if (!strcmp(n, "CODENAME"))     return jni_make_string("REL");
@@ -2240,7 +2253,7 @@ static juint field_int(const FakeID *id) {
   if (!strcmp(n, "versionCode")) return APP_VERSION_CODE;
   if (!strcmp(n, "longVersionCode")) return APP_VERSION_CODE;
   if (name_has(c, "unity3d/player/UnityPlayer")) {
-    if (!strcmp(n, "SDK_INT"))     return NX_SDK_INT;
+    if (!strcmp(n, "SDK_INT"))     return device_sdk_int();
     if (!strcmp(n, "densityDpi"))  return 320;
     if (!strcmp(n, "widthPixels")) return (juint)screen_width;
     if (!strcmp(n, "heightPixels"))return (juint)screen_height;
@@ -2265,7 +2278,7 @@ static juint field_int(const FakeID *id) {
     if (!strcmp(n, "CERT_INPUT_SHA256")) return 1;
   }
   if (name_has(c, "os/Build")) {
-    if (!strcmp(n, "SDK_INT"))          return NX_SDK_INT;
+    if (!strcmp(n, "SDK_INT"))          return device_sdk_int();
     if (!strcmp(n, "PREVIEW_SDK_INT"))  return 0;
   }
   if (name_has(c, "DisplayMetrics")) {

@@ -121,7 +121,8 @@ sdmc:/config/genshinimpact_nx/device_profile.ini
 
 The file is optional; absent keys keep the built-in defaults. Recognized keys:
 `model`, `device_name`, `manufacturer`, `brand`, `product`, `device`, `board`,
-`hardware`, `platform`, `fingerprint`, `version_release`, `version_sdk`,
+`hardware`, `platform`, `fingerprint`, `build_id`, `display_id`, `build_host`,
+`build_user`, `characteristics`, `version_release`, `version_sdk`,
 `security_patch`, `incremental`, `android_id` (16 hex digits; app-scoped on
 modern Android, so the system `settings` value may not match what the game
 sees), and `device_fp` (SDK fingerprint session token; usually left unset).

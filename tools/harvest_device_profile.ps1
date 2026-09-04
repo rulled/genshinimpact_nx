@@ -9,10 +9,8 @@
 #      sdmc:/config/genshinimpact_nx/device_profile.ini
 #
 # Notes:
-#   - ANDROID_ID is app-scoped on modern Android; `settings get secure
-#     android_id` returns the system value, not the one the game sees, so
-#     it is emitted commented out.  Only enable it if you know the app
-#     scoped value.
+#   - ANDROID_ID is app-scoped on modern Android. The shell-visible settings
+#     value is not collected because it is not the value the game sees.
 #   - device_fp is a session token produced by the miHoYo SDK fingerprint
 #     flow and cannot be read from system properties; leave it unset unless
 #     you captured one from a real client session.
@@ -23,12 +21,27 @@ if (-not (Get-Command adb -ErrorAction SilentlyContinue)) {
     Write-Error "adb not found in PATH. Install platform-tools first."
 }
 
+function Invoke-Adb([string[]]$Arguments) {
+    $output = & adb @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "adb $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
+    }
+    ($output -join "`n").Trim()
+}
+
 function Get-Prop([string]$name) {
-    (adb shell getprop $name).Trim()
+    Invoke-Adb @('shell', 'getprop', $name)
+}
+
+$devices = @(Invoke-Adb @('devices') -split "`n" |
+    Where-Object { $_ -match "`tdevice$" })
+if ($devices.Count -ne 1) {
+    throw "Expected exactly one authorized adb device, found $($devices.Count)."
 }
 
 $props = [ordered]@{
     model           = 'ro.product.model'
+    device_name     = 'ro.product.marketname'
     manufacturer    = 'ro.product.manufacturer'
     brand           = 'ro.product.brand'
     product         = 'ro.product.name'
@@ -37,10 +50,23 @@ $props = [ordered]@{
     hardware        = 'ro.hardware'
     platform        = 'ro.board.platform'
     fingerprint     = 'ro.build.fingerprint'
+    build_id        = 'ro.build.id'
+    display_id      = 'ro.build.display.id'
+    build_host      = 'ro.build.host'
+    build_user      = 'ro.build.user'
+    characteristics = 'ro.build.characteristics'
     version_release = 'ro.build.version.release'
     version_sdk     = 'ro.build.version.sdk'
     security_patch  = 'ro.build.version.security_patch'
     incremental     = 'ro.build.version.incremental'
+}
+
+$values = [ordered]@{}
+foreach ($entry in $props.GetEnumerator()) {
+    $values[$entry.Key] = Get-Prop $entry.Value
+}
+if (-not $values.device_name) {
+    $values.device_name = $values.model
 }
 
 $lines = @(
@@ -49,8 +75,8 @@ $lines = @(
     ''
 )
 
-foreach ($entry in $props.GetEnumerator()) {
-    $value = Get-Prop $entry.Value
+foreach ($entry in $values.GetEnumerator()) {
+    $value = $entry.Value
     if ($value) {
         $lines += "$($entry.Key)=$value"
     } else {
@@ -58,18 +84,13 @@ foreach ($entry in $props.GetEnumerator()) {
     }
 }
 
-$androidId = (adb shell settings get secure android_id).Trim()
 $lines += ''
-$lines += '# App-scoped on modern Android; enable only if you know the value:'
-if ($androidId -and $androidId -ne 'null') {
-    $lines += "# android_id=$androidId"
-} else {
-    $lines += '# android_id='
-}
+$lines += '# App-scoped on modern Android; enable only if independently known:'
+$lines += '# android_id='
 $lines += '# Session token from the SDK fingerprint flow, if captured:'
 $lines += '# device_fp='
 
 $outPath = Join-Path $PSScriptRoot 'device_profile.ini'
-$lines | Set-Content -Encoding ascii -Path $outPath
+$lines | Set-Content -Encoding utf8 -Path $outPath
 Write-Host "Wrote $outPath"
 Write-Host "Copy it to: sdmc:/config/genshinimpact_nx/device_profile.ini"
