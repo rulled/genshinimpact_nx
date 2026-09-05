@@ -73,6 +73,15 @@ jobs:
           DEVKITPRO: /opt/devkitpro
           DEVKITA64: /opt/devkitpro/devkitA64
 
+      - name: Check loaderless Vulkan ABI
+        run: |
+          make check-loaderless-abi \
+            NVK_SWITCH_ROOT=/opt/nvk-switch \
+            VULKAN_HEADERS_ROOT=/opt/Vulkan-Headers
+        env:
+          DEVKITPRO: /opt/devkitpro
+          DEVKITA64: /opt/devkitpro/devkitA64
+
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

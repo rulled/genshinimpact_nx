@@ -53,12 +53,14 @@ NVK_SWITCH_CPPFLAGS += -I$(NVK_SWITCH_ROOT)/include -DVK_USE_PLATFORM_VI_NN
 NVK_SWITCH_CPPFLAGS += -DGENSHIN_EXTERNAL_LOADERLESS_NVK
 NVK_SWITCH_LDFLAGS  :=
 NVK_SWITCH_LIBS     := -L$(NVK_SWITCH_ROOT)/lib -lvulkan -lz -lzstd -lnx -lstdc++ -lm
+LOADERLESS_VULKAN_ARCHIVE := $(NVK_SWITCH_ROOT)/lib/libvulkan.a
 BUILD               := build_nx_external
 else
 ifeq ($(wildcard $(NVK_SWITCH_SDK)/share/nvk-switch/nvk-switch.mk),)
 $(error "Missing Mesa/NVK SDK. Set NVK_SWITCH_ROOT to a public SDK prefix or provide $(NVK_SWITCH_SDK)")
 endif
 include $(NVK_SWITCH_SDK)/share/nvk-switch/nvk-switch.mk
+LOADERLESS_VULKAN_ARCHIVE := $(NVK_SWITCH_SDK)/lib/libvulkan.a
 BUILD := build_nx
 endif
 
@@ -105,9 +107,15 @@ export INCLUDE := $(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
                   -I$(PORTLIBS)/include/SDL2 -I$(CURDIR)/$(BUILD)
 export LIBPATHS := $(foreach dir,$(LIBDIRS),-L$(dir)/lib)
 
-.PHONY: all clean preflight
+.PHONY: all clean preflight check-loaderless-abi
 all: $(BUILD)
 	@$(MAKE) --no-print-directory -C $(BUILD) -f $(CURDIR)/Makefile
+
+check-loaderless-abi: all
+	@sh tools/check_loaderless_abi.sh \
+		"$(LOADERLESS_VULKAN_ARCHIVE)" \
+		"$(BUILD)/vulkan_bridge.o" \
+		"$(TARGET).elf"
 
 preflight:
 	@printf '%s\n' "DEVKITPRO=$(DEVKITPRO)" "NVK_SWITCH_ROOT=$(NVK_SWITCH_ROOT)" "VULKAN_HEADERS_ROOT=$(VULKAN_HEADERS_ROOT)" "NVK_SWITCH_SDK=$(NVK_SWITCH_SDK)"
