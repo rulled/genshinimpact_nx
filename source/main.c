@@ -2716,9 +2716,12 @@ int main(int argc, char **argv) {
         const unsigned long long pool_free = diag.pool_free_bytes;
         fprintf(lf,
                 "[I] mem: cap=%lluM head=%lluM pool_free=%lluB "
-                "fio_active=%llu oldest=%llums slot=%u kind=%u fin=%llu/%llu\n",
+                "map=%llu last=0x%x fio_active=%llu oldest=%llums "
+                "slot=%u kind=%u fin=%llu/%llu\n",
                 donor_cap, donor_head,
                 (pool_free == UINT64_MAX) ? UINT64_MAX : pool_free,
+                (unsigned long long)diag.map_call_count,
+                diag.last_map_result,
                 (unsigned long long)fio.size_operations_active,
                 (unsigned long long)fio.oldest_size_operation_ms,
                 (fio.oldest_size_operation_slot == UINT32_MAX)
@@ -2745,6 +2748,22 @@ int main(int argc, char **argv) {
                 (unsigned long long)fio.direct_write_failures,
                 (unsigned long long)fio.bounce_bytes,
                 (unsigned long long)fio.bounce_writes);
+        fprintf(lf,
+                "[I] gc: susp=%u resume=%u fail=%u active=%u retry=%u "
+                "deferred=%u mask=%u worker=%u/%u\n",
+                __atomic_load_n(&g_gc_bridge_suspends, __ATOMIC_RELAXED),
+                __atomic_load_n(&g_gc_bridge_resumes, __ATOMIC_RELAXED),
+                __atomic_load_n(&g_gc_bridge_failures, __ATOMIC_RELAXED),
+                __atomic_load_n(&g_gc_bridge_active_targets, __ATOMIC_RELAXED),
+                __atomic_load_n(&g_gc_bridge_capture_retries, __ATOMIC_RELAXED),
+                __atomic_load_n(&g_gc_bridge_deferred_deliveries,
+                                __ATOMIC_RELAXED),
+                __atomic_load_n(&g_gc_bridge_signal_mask_deferrals,
+                                __ATOMIC_RELAXED),
+                __atomic_load_n(&g_gc_bridge_worker_dependency_releases,
+                                __ATOMIC_RELAXED),
+                __atomic_load_n(&g_gc_bridge_worker_release_failures,
+                                __ATOMIC_RELAXED));
         fclose(lf);
       }
     }

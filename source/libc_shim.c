@@ -1673,15 +1673,6 @@ static void fd_ino_clear(int fd) {
   mutexUnlock(&g_fd_metadata_lock);
   free(old);
 }
-static int fd_reopen_independent(int fd) {
-  char *path = fd_path_snapshot(fd);
-  if (!path) return -1;
-  int reopened = open(path, O_RDWR);
-  int saved = errno;
-  free(path);
-  errno = saved;
-  return reopened;
-}
 static char *fd_path_snapshot(int fd) {
   if (fd < 0 || fd >= FD_INO_MAX) return NULL;
   mutexLock(&g_fd_metadata_lock);
@@ -3758,7 +3749,6 @@ void nx_sparse_arena_get_diagnostics(NxSparseArenaDiagnostics *out) {
      * was deferred. */
     nx_guest_gc_critical_enter();
     const int locked = mutexTryLock(&g_mmap_lock);
-    nx_guest_gc_critical_leave();
     if (locked) {
       uint64_t free_pages = 0;
       uint64_t largest_pages = 0;
@@ -3768,10 +3758,12 @@ void nx_sparse_arena_get_diagnostics(NxSparseArenaDiagnostics *out) {
         if (oc_dynamic_extents[node].pages > largest_pages)
           largest_pages = oc_dynamic_extents[node].pages;
       }
-      mmap_broker_unlock();
+      mutexUnlock(&g_mmap_lock);
+      nx_guest_gc_critical_leave();
       out->pool_free_bytes = free_pages * MMAP_PAGE;
       out->pool_largest_free_bytes = largest_pages * MMAP_PAGE;
     } else {
+      nx_guest_gc_critical_leave();
       out->pool_free_bytes = UINT64_MAX;  /* sentinel: broker busy */
       out->pool_largest_free_bytes = UINT64_MAX;
     }
@@ -4383,9 +4375,15 @@ static SharedFileMap g_shared_maps[MMAP_SHARED_MAX];
 static Mutex g_shared_map_lock;
 
 static int mmap_shared_register(void *ptr, size_t len, int fd, long offset) {
-  int retained = fd_reopen_independent(fd);
+  char *path = fd_path_snapshot(fd);
+  int retained = path ? open(path, O_RDWR) : -1;
   if (retained < 0) retained = fcntl(fd, F_DUPFD_CLOEXEC, 0);
-  if (retained < 0) return 0;
+  if (retained < 0) { free(path); return 0; }
+  if (path) {
+    fd_ino_set(retained, path);
+    nx_file_io_track_open(retained, path, 1);
+    free(path);
+  }
   mutexLock(&g_shared_map_lock);
   for (int i = 0; i < MMAP_SHARED_MAX; i++) if (!g_shared_maps[i].used) {
     g_shared_maps[i] = (SharedFileMap){ 1, ptr, len, retained, offset };
@@ -4393,7 +4391,7 @@ static int mmap_shared_register(void *ptr, size_t len, int fd, long offset) {
     return 1;
   }
   mutexUnlock(&g_shared_map_lock);
-  close(retained);
+  close_fake(retained);
   errno = ENOMEM;
   return 0;
 }
@@ -4405,15 +4403,14 @@ static int mmap_shared_flush_one(const SharedFileMap *map, uintptr_t start,
   if (start < map_start) start = map_start;
   if (end > map_end) end = map_end;
   if (start >= end) return 0;
-  long saved = lseek(map->fd, 0, SEEK_CUR);
   uint64_t file_offset = (uint64_t)map->offset + (start - map_start);
-  if (saved < 0 || file_offset > LONG_MAX ||
-      lseek(map->fd, (long)file_offset, SEEK_SET) < 0) return -1;
+  if (file_offset > LONG_MAX) { errno = EOVERFLOW; return -1; }
   const uint8_t *bytes = (const uint8_t *)start;
   size_t left = end - start;
   int failure = 0;
   while (left) {
-    long wrote = write(map->fd, bytes, left);
+    const size_t chunk = left < UINT64_C(0x10000) ? left : UINT64_C(0x10000);
+    long wrote = nx_pwrite(map->fd, bytes, chunk, (long)file_offset);
     if (wrote <= 0) {
       if (wrote == 0) errno = EIO;
       failure = errno;
@@ -4421,8 +4418,8 @@ static int mmap_shared_flush_one(const SharedFileMap *map, uintptr_t start,
     }
     bytes += (size_t)wrote;
     left -= (size_t)wrote;
+    file_offset += (uint64_t)wrote;
   }
-  if (lseek(map->fd, saved, SEEK_SET) < 0 && !failure) failure = errno;
   if (!failure && synchronize && fsync(map->fd) < 0) failure = errno;
   if (failure) { errno = failure; return -1; }
   return 0;
@@ -4494,7 +4491,7 @@ static int mmap_shared_retire(void *addr, size_t length, int *partial) {
   int result = mmap_shared_flush_one(&map, (uintptr_t)map.ptr,
                                      (uintptr_t)map.ptr + map.len, 1);
   int saved = errno;
-  close(map.fd);
+  close_fake(map.fd);
   errno = saved;
   return result;
 }
