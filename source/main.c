@@ -37,6 +37,7 @@
 #include "unity_entrypoints.h"
 #include "unity_jni.h"
 #include "util.h"
+#include "vulkan_bridge.h"
 #include "vulkan_egl_stubs.h"
 
 #define DATA_ROOT       GAME_HOME
@@ -2010,6 +2011,11 @@ static inline void write_thread_pointer(uintptr_t value) {
 }
 
 static void shutdown_host(void) {
+  FILE *file = fopen(DATA_ROOT "/run_log.txt", "ab");
+  if (file) {
+    nx_vk_report(file);
+    fclose(file);
+  }
   android_native_vibration_shutdown();
   opensles_shutdown();
   combo_auth_shutdown();
@@ -2212,6 +2218,7 @@ void abort(void) {
       }
     }
     panic_capture_report(f);
+    nx_vk_report(f);
     {
       NxSparseArenaDiagnostics diag = {0};
       nx_sparse_arena_get_diagnostics(&diag);
@@ -2282,32 +2289,12 @@ int main(int argc, char **argv) {
     putenv(rust_backtrace_env);
   }
 
-  /* NVK/Mesa env vars for the resource-download device-lost investigation
-   * (vkQueueSubmit #1001 returns VK_ERROR_DEVICE_LOST after
-   * FilesDownloadPipe StartDownload).  NVK is statically linked into this NRO
-   * and reads the same environ; getenv_fake (libc_shim.c) passes unknown vars
-   * through to the real getenv, so these reach the driver without code changes
-   * to the Vulkan path.
-   *
-   * NVK_DEBUG=push_sync serializes each push-buffer submission: if the
-   * device-lost disappears under it, the hang is timing/watchdog-induced
-   * (download-burst overrunning the nvhost channel) and a fence-throttle in
-   * the existing nx_vkQueueSubmit hook is the productionizable fix.  If it
-   * persists on the same submit, the offending command buffer is
-   * deterministic and Mesa-side.  push_dump captures that buffer to
-   * stderr.txt (bound above).
-   *
-   * MESA_VK_ABORT_ON_DEVICE_LOST turns the first device-lost into a SIGABRT
-   * instead of a silent -4 return the game then mishandles; combined with
-   * RUST_BACKTRACE=1 this yields a backtrace at the failing submit. */
+  /* Preserve immediate failure capture without forcing NVK's push_sync mode.
+   * NX_VK_SERIALIZE_QUEUE=1 serializes only the bridge's intercepted
+   * vkQueueSubmit/vkQueuePresentKHR calls and disables its normal periodic
+   * submit drain, allowing a clean comparison with the stable default path. */
   {
-    static char nvk_debug_env[] = "NVK_DEBUG=push_sync";
-    static char nvk_dump_env[] = "NVK_DEBUG=push_sync,push_dump";
     static char abort_env[] = "MESA_VK_ABORT_ON_DEVICE_LOST=1";
-    /* push_sync alone first; add push_dump on a follow-up build if the hang
-     * survives serialization, to keep stderr.txt from filling on good runs. */
-    (void)nvk_dump_env;
-    putenv(nvk_debug_env);
     putenv(abort_env);
   }
 

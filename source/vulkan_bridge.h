@@ -1,6 +1,8 @@
 #ifndef GENSHIN_VULKAN_BRIDGE_H
 #define GENSHIN_VULKAN_BRIDGE_H
 
+#include <stdio.h>
+
 #include <vulkan/vulkan_core.h>
 #include <vulkan/vulkan_android.h>
 #include <vulkan/vulkan_vi.h>
@@ -24,5 +26,6 @@ VKAPI_ATTR VkResult VKAPI_CALL nx_vkCreateAndroidSurfaceKHR(
   VkSurfaceKHR *surface);
 
 void *nx_vk_lookup(const char *name);
+void nx_vk_report(FILE *file);
 
 #endif
