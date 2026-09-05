@@ -750,6 +750,7 @@ typedef struct {
   int64_t physical_size;
   char path[NX_FS_TRACKED_PATH];
   unsigned used;
+  unsigned acquisitions;
   unsigned initialized;
   unsigned bulk_eligible;
   uint64_t size_operation_started_tick;
@@ -759,6 +760,8 @@ typedef struct {
 static Mutex g_file_size_registry_lock;
 static NxTrackedFileSize g_file_sizes[NX_FS_TRACKED_FILES];
 
+static void nx_file_size_release(NxTrackedFileSize *entry);
+
 #define FILE_IO_ADD(field, value) \
   __atomic_fetch_add(&g_file_io_diagnostics.field, (uint64_t)(value), \
                      __ATOMIC_RELAXED)
@@ -766,7 +769,6 @@ static NxTrackedFileSize g_file_sizes[NX_FS_TRACKED_FILES];
 enum {
   NX_FILE_SIZE_OP_EXTEND = 1,
   NX_FILE_SIZE_OP_FALLBACK = 2,
-  NX_FILE_SIZE_OP_FINALIZE = 3,
 };
 
 static void nx_file_size_operation_begin(NxTrackedFileSize *entry,
@@ -877,10 +879,12 @@ static NxTrackedFileSize *nx_file_size_acquire(NxFsdevFile *file,
       entry = candidate;
       break;
     }
-    if (!candidate->used && !free_entry) free_entry = candidate;
+    if (!candidate->used && !candidate->acquisitions && !free_entry)
+      free_entry = candidate;
   }
   if (!entry && create && free_entry) {
     entry = free_entry;
+    /* acquisitions == 0 guarantees no owner or waiter can hold this lock. */
     mutexLock(&entry->lock);
     entry->file = file;
     entry->logical_size = 0;
@@ -891,20 +895,32 @@ static NxTrackedFileSize *nx_file_size_acquire(NxFsdevFile *file,
     __atomic_store_n(&entry->size_operation_started_tick, 0,
                      __ATOMIC_RELAXED);
     __atomic_store_n(&entry->size_operation_kind, 0, __ATOMIC_RELAXED);
+    entry->acquisitions = 1;
     entry->used = 1;
     mutexUnlock(&g_file_size_registry_lock);
     return entry;
   }
   if (entry) {
-    mutexLock(&entry->lock);
-    if (bulk_eligible) entry->bulk_eligible = 1;
+    ++entry->acquisitions;
   }
   mutexUnlock(&g_file_size_registry_lock);
+  if (entry) {
+    mutexLock(&entry->lock);
+    if (!entry->used || entry->file != file) {
+      nx_file_size_release(entry);
+      return NULL;
+    }
+    if (bulk_eligible) entry->bulk_eligible = 1;
+  }
   return entry;
 }
 
 static void nx_file_size_release(NxTrackedFileSize *entry) {
-  if (entry) mutexUnlock(&entry->lock);
+  if (!entry) return;
+  mutexUnlock(&entry->lock);
+  mutexLock(&g_file_size_registry_lock);
+  --entry->acquisitions;
+  mutexUnlock(&g_file_size_registry_lock);
 }
 
 static int nx_file_size_cached(NxFsdevFile *file, int64_t *size_out) {
@@ -932,34 +948,15 @@ void nx_file_io_track_open(int fd, const char *path, int writable) {
   errno = saved_errno;
 }
 
-static int nx_file_io_prepare_write(NxFsdevFile *file, uint64_t end) {
-  NxTrackedFileSize *entry = nx_file_size_acquire(file, 0, 0);
-  if (!entry) {
-    int64_t current_size = 0;
-    FILE_IO_ADD(size_queries, 1);
-    if (R_FAILED(fsFileGetSize(&file->file, &current_size)) ||
-        current_size < 0) {
-      FILE_IO_ADD(size_query_failures, 1);
-      errno = EIO;
-      return -1;
-    }
-    if (end <= (uint64_t)current_size) return 0;
-    if (R_FAILED(fsFileSetSize(&file->file, (int64_t)end))) {
-      FILE_IO_ADD(size_extension_failures, 1);
-      errno = EIO;
-      return -1;
-    }
-    FILE_IO_ADD(size_extensions, 1);
-    return 0;
-  }
-
+static int nx_file_size_initialize_locked(NxFsdevFile *file,
+                                           NxTrackedFileSize *entry) {
+  if (!entry) return 0;
   if (!entry->initialized) {
     FILE_IO_ADD(size_queries, 1);
     int64_t current_size = 0;
     if (R_FAILED(fsFileGetSize(&file->file, &current_size)) ||
         current_size < 0) {
       FILE_IO_ADD(size_query_failures, 1);
-      nx_file_size_release(entry);
       errno = EIO;
       return -1;
     }
@@ -969,37 +966,26 @@ static int nx_file_io_prepare_write(NxFsdevFile *file, uint64_t end) {
   } else {
     FILE_IO_ADD(size_cache_hits, 1);
   }
-
-  /* Extend only to the requested logical end.  Speculative 1 MiB extents
-   * made interrupted FAT32 downloads harder to diagnose and widened the
-   * amount of metadata left in flight without improving write correctness. */
-  const uint64_t target = end;
-  if (end > (uint64_t)entry->logical_size)
-    entry->logical_size = (int64_t)end;
-
-  if (target > (uint64_t)entry->physical_size) {
-    nx_file_size_operation_begin(entry, NX_FILE_SIZE_OP_EXTEND);
-    Result result = fsFileSetSize(&file->file, (int64_t)target);
-    nx_file_size_operation_end(entry);
-    if (R_FAILED(result)) {
-      FILE_IO_ADD(size_extension_failures, 1);
-      /* Match ordinary pwrite extension semantics: a failed extension must
-       * not leave the logical view beyond the last physical byte. */
-      if (entry->logical_size > entry->physical_size)
-        entry->logical_size = entry->physical_size;
-      nx_file_size_release(entry);
-      errno = EIO;
-      return -1;
-    }
-    FILE_IO_ADD(size_extensions, 1);
-    if (target > end) {
-      FILE_IO_ADD(preallocation_extensions, 1);
-      FILE_IO_ADD(preallocated_bytes, target - end);
-    }
-    entry->physical_size = (int64_t)target;
-  }
-  nx_file_size_release(entry);
   return 0;
+}
+
+static Result nx_fsdev_write_chunk(NxFsdevFile *file,
+                                   NxTrackedFileSize *entry, int64_t offset,
+                                   const void *buffer, size_t count) {
+  const int64_t end = offset + (int64_t)count;
+  const int extends = entry && end > entry->physical_size;
+  if (extends) nx_file_size_operation_begin(entry, NX_FILE_SIZE_OP_EXTEND);
+  const Result result = fsFileWrite(&file->file, offset, buffer, count,
+                                    FsWriteOption_None);
+  if (extends) nx_file_size_operation_end(entry);
+  if (R_FAILED(result)) {
+    if (extends) FILE_IO_ADD(size_extension_failures, 1);
+    return result;
+  }
+  if (extends) FILE_IO_ADD(size_extensions, 1);
+  if (entry && end > entry->logical_size) entry->logical_size = end;
+  if (entry && end > entry->physical_size) entry->physical_size = end;
+  return result;
 }
 
 int nx_file_io_logical_size(int fd, int64_t *size_out) {
@@ -1020,14 +1006,16 @@ int nx_file_io_logical_size_path(const char *path, int64_t *size_out) {
   for (unsigned i = 0; i < NX_FS_TRACKED_FILES; ++i) {
     NxTrackedFileSize *entry = &g_file_sizes[i];
     if (!entry->used || strcmp(entry->path, path)) continue;
+    ++entry->acquisitions;
+    mutexUnlock(&g_file_size_registry_lock);
     mutexLock(&entry->lock);
     if (entry->used && entry->initialized && !strcmp(entry->path, path)) {
       *size_out = entry->logical_size;
       result = 1;
-      mutexUnlock(&entry->lock);
-      break;
     }
-    mutexUnlock(&entry->lock);
+    nx_file_size_release(entry);
+    errno = saved_errno;
+    return result;
   }
   mutexUnlock(&g_file_size_registry_lock);
   errno = saved_errno;
@@ -1036,61 +1024,22 @@ int nx_file_io_logical_size_path(const char *path, int64_t *size_out) {
 
 void nx_file_io_finalize_fd(int fd) {
   const int saved_errno = errno;
-  __handle *handle = __get_handle(fd);
-  /* newlib dup/fcntl descriptors share one refcounted devoptab handle.  Only
-   * the last close may trim and retire its shared logical-size record. */
-  if (!handle || handle->refcount > 1) { errno = saved_errno; return; }
   NxFsdevFile *file = nx_positional_fsdev_file(fd);
   if (!file) { errno = saved_errno; return; }
 
+  NxTrackedFileSize *entry = nx_file_size_acquire(file, 0, 0);
+  if (!entry) { errno = saved_errno; return; }
+  /* Every close retires the shared fileStruct pointer.  A surviving duplicate
+   * lazily recreates the cache, avoiding stale entries if concurrent closes
+   * both observe a non-final newlib refcount. */
   mutexLock(&g_file_size_registry_lock);
-  NxTrackedFileSize *entry = NULL;
-  for (unsigned i = 0; i < NX_FS_TRACKED_FILES; ++i) {
-    if (g_file_sizes[i].used && g_file_sizes[i].file == file) {
-      entry = &g_file_sizes[i];
-      break;
-    }
-  }
-  if (!entry) {
-    mutexUnlock(&g_file_size_registry_lock);
-    errno = saved_errno;
-    return;
-  }
-  mutexLock(&entry->lock);
-  /* Capture the trim decision, then retire the slot, all under the per-entry
-   * lock.  Releasing the global registry lock BEFORE the trim IPC is the fix
-   * for the verification hang: g_file_size_registry_lock serializes every
-   * read/write/stat in the process, so holding it across the fsFileSetSize
-   * FS IPC wedged all I/O when the trim stalled while ~1100 downloaded files
-   * were closed at once.  Mirrors nx_file_io_prepare_write, which likewise
-   * drops the registry lock before fsFileSetSize.  The per-entry lock stays
-   * held across the IPC: the slot is already marked unused (used=0), so no
-   * opener can reacquire it, and the fd is mid-close so no other operation
-   * races on this entry. */
-  const int do_trim =
-    entry->initialized && entry->physical_size > entry->logical_size;
-  const int64_t trim_logical = entry->logical_size;
-  const uint64_t trimmed = do_trim
-    ? (uint64_t)(entry->physical_size - entry->logical_size) : 0;
   entry->used = 0;
   entry->file = NULL;
   entry->initialized = 0;
   entry->bulk_eligible = 0;
   entry->path[0] = '\0';
   mutexUnlock(&g_file_size_registry_lock);
-  if (do_trim) {
-    FILE_IO_ADD(finalize_calls, 1);
-    nx_file_size_operation_begin(entry, NX_FILE_SIZE_OP_FINALIZE);
-    const Result resize_result = fsFileSetSize(&file->file, trim_logical);
-    nx_file_size_operation_end(entry);
-    if (R_FAILED(resize_result)) {
-      FILE_IO_ADD(finalize_failures, 1);
-    } else {
-      FILE_IO_ADD(finalized_bytes, trimmed);
-      entry->physical_size = trim_logical;
-    }
-  }
-  mutexUnlock(&entry->lock);
+  nx_file_size_release(entry);
   errno = saved_errno;
 }
 
@@ -1165,21 +1114,17 @@ static long nx_fsdev_pread(NxFsdevFile *file, void *buffer, size_t count,
   return (long)done;
 }
 
-static long nx_fsdev_pwrite(NxFsdevFile *file, const void *buffer,
-                            size_t count, int64_t offset) {
+static long nx_fsdev_pwrite_locked(NxFsdevFile *file,
+                                   NxTrackedFileSize *entry,
+                                   const void *buffer, size_t count,
+                                   int64_t offset) {
   FILE_IO_ADD(write_calls, 1);
-  const uint64_t end = (uint64_t)offset + (uint64_t)count;
-  if (nx_file_io_prepare_write(file, end) != 0) {
-    FILE_IO_ADD(write_failures, 1);
-    return -1;
-  }
   Result result;
   /* The Android image passes Unity mmap-backed buffers which Horizon FS does
    * not accept as IPC transfer memory.  Probe until the first rejection, then
    * avoid paying for one known-failing FS command on every small TLS chunk. */
   if (!__atomic_load_n(&g_fs_write_requires_bounce, __ATOMIC_RELAXED)) {
-    result = fsFileWrite(&file->file, offset, buffer, count,
-                         FsWriteOption_None);
+    result = nx_fsdev_write_chunk(file, entry, offset, buffer, count);
     if (R_SUCCEEDED(result)) {
       FILE_IO_ADD(direct_writes, 1);
       FILE_IO_ADD(write_bytes, count);
@@ -1205,8 +1150,8 @@ static long nx_fsdev_pwrite(NxFsdevFile *file, const void *buffer,
     const size_t wanted = count - done < NX_FS_TRANSFER_PAGE
       ? count - done : NX_FS_TRANSFER_PAGE;
     memcpy(page, (const unsigned char *)buffer + done, wanted);
-    result = fsFileWrite(&file->file, offset + (int64_t)done, page, wanted,
-                         FsWriteOption_None);
+    result = nx_fsdev_write_chunk(file, entry, offset + (int64_t)done, page,
+                                  wanted);
     if (R_FAILED(result)) {
       FILE_IO_ADD(write_failures, 1);
       if (done) {
@@ -1232,6 +1177,21 @@ static long nx_fsdev_pwrite(NxFsdevFile *file, const void *buffer,
     return -1;
   }
   return (long)done;
+}
+
+static long nx_fsdev_pwrite(NxFsdevFile *file, const void *buffer,
+                            size_t count, int64_t offset) {
+  NxTrackedFileSize *entry = nx_file_size_acquire(file, 1, 0);
+  if (nx_file_size_initialize_locked(file, entry) != 0) {
+    FILE_IO_ADD(write_calls, 1);
+    FILE_IO_ADD(write_failures, 1);
+    nx_file_size_release(entry);
+    return -1;
+  }
+  const long result = nx_fsdev_pwrite_locked(file, entry, buffer, count,
+                                              offset);
+  nx_file_size_release(entry);
+  return result;
 }
 
 static long nx_pread_backend(int fd, void *buffer, size_t count, long offset) {
@@ -1287,19 +1247,42 @@ static long nx_fsdev_read(NxFsdevFile *file, void *buffer, size_t count) {
 static long nx_fsdev_write(NxFsdevFile *file, const void *buffer,
                            size_t count) {
   if ((file->flags & O_ACCMODE) == O_RDONLY) { errno = EBADF; return -1; }
+  NxTrackedFileSize *entry = nx_file_size_acquire(file, 1, 0);
+  if ((file->flags & O_APPEND) &&
+      nx_file_size_initialize_locked(file, entry) != 0) {
+    FILE_IO_ADD(write_calls, 1);
+    FILE_IO_ADD(write_failures, 1);
+    nx_file_size_release(entry);
+    return -1;
+  }
   int64_t offset = file->offset;
   if (file->flags & O_APPEND) {
-    if (R_FAILED(fsFileGetSize(&file->file, &offset)) || offset < 0) {
+    if (entry) {
+      offset = entry->logical_size;
+    } else if (R_FAILED(fsFileGetSize(&file->file, &offset)) || offset < 0) {
+      nx_file_size_release(entry);
+      FILE_IO_ADD(write_calls, 1);
+      FILE_IO_ADD(write_failures, 1);
       errno = EIO;
       return -1;
     }
   }
+  if (!(file->flags & O_APPEND) &&
+      nx_file_size_initialize_locked(file, entry) != 0) {
+    FILE_IO_ADD(write_calls, 1);
+    FILE_IO_ADD(write_failures, 1);
+    nx_file_size_release(entry);
+    return -1;
+  }
   if (offset < 0 || count > (size_t)(INT64_MAX - offset)) {
+    nx_file_size_release(entry);
     errno = EINVAL;
     return -1;
   }
-  const long result = nx_fsdev_pwrite(file, buffer, count, offset);
+  const long result = nx_fsdev_pwrite_locked(file, entry, buffer, count,
+                                              offset);
   if (result > 0) file->offset = offset + result;
+  nx_file_size_release(entry);
   return result;
 }
 
@@ -1474,9 +1457,19 @@ int nx_ftruncate(int fd, long length) {
   if (length < 0) { errno = EINVAL; return -1; }
   uint32_t stripe;
   if (!nx_fd_route_source_lock(fd, &stripe)) return -1;
+  NxFsdevFile *file = nx_positional_fsdev_file(fd);
+  const int lookup_errno = errno;
+  NxTrackedFileSize *entry = file
+    ? nx_file_size_acquire(file, 1, 0) : NULL;
+  if (!file) errno = lookup_errno;
   const int result = ftruncate(fd, length);
   const int saved_errno = errno;
-  if (result == 0) nx_file_io_note_truncate(fd, length);
+  if (result == 0 && entry) {
+    entry->logical_size = length;
+    entry->physical_size = length;
+    entry->initialized = 1;
+  }
+  nx_file_size_release(entry);
   nx_fd_route_source_unlock(stripe);
   errno = saved_errno;
   return result;
