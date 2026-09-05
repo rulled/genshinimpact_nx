@@ -1343,7 +1343,7 @@ static void patch_unity_java_class_resolution(void) {
     UINT32_C(0xb40003e0), /* null jclass -> existing exception path */
     UINT32_C(0xaa0003f4), /* mov x20, x0 (owned local jclass) */
     UINT32_C(0xf00163a8), /* adrp x8, AndroidJavaClass metadata page */
-    UINT32_C(0xf9403508), /* ldr x8, [x8, #0x68] */
+    UINT32_C(0xf940dd08), /* ldr x8, [x8, #0x1b8] */
     UINT32_C(0xaa0803e0), /* mov x0, x8 */
     UINT32_C(0x9766870f), /* bl il2cpp_object_new, RVA 0x0F814C34 */
     UINT32_C(0xb4000320), /* allocation failure -> existing exception path */
