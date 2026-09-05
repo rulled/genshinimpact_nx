@@ -2,7 +2,7 @@ name: Build genshinimpact_nx.nro
 
 on:
   push:
-    branches: [main]
+    branches: [main, experiment/nvk-26.1.4-loaderless]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -34,32 +34,24 @@ jobs:
       - name: Install public NVK SDK
         run: |
           set -eux
-          NVK_URL=https://github.com/jhuz0/nvk-switch/releases/download/nvk-switch-mesa-25.0.7-r1/nvk-switch-25.0.7.tar.xz
-          NVK_SHA256=4ab244f982dc078aaff8c58640d7cf8a0f3ab43bbf2daadfd00c02fbf352af86
+          NVK_URL=https://github.com/rulled/nvk-switch/releases/download/mesa-26.1.4-nxvk-69ec283-r1/nvk-switch-mesa-26.1.4-nxvk-69ec283-r1.tar.xz
+          NVK_SHA256=c4682dbbe252cee9d22f98863786d71faa6a3b8a9d7db94e53929b2ab698f43d
           curl -fL "$NVK_URL" -o /tmp/nvk-switch.tar.xz
           echo "$NVK_SHA256  /tmp/nvk-switch.tar.xz" | sha256sum -c -
           mkdir -p /opt/nvk-switch
-          tar -xJf /tmp/nvk-switch.tar.xz -C /opt/nvk-switch
+          tar -xJf /tmp/nvk-switch.tar.xz -C /opt/nvk-switch --strip-components=1
           test -f /opt/nvk-switch/lib/libvulkan.a
           test -f /opt/nvk-switch/include/vulkan/vulkan_vi.h
-
-      - name: Install matching Vulkan video headers
-        run: |
-          set -eux
-          git clone --filter=blob:none --no-checkout \
-            https://github.com/KhronosGroup/Vulkan-Headers.git \
-            /opt/Vulkan-Headers
-          git -C /opt/Vulkan-Headers checkout --detach \
-            a03d2f6d5753b365d704d58161825890baad0755
-          grep -q '#define VK_HEADER_VERSION 305' \
-            /opt/Vulkan-Headers/include/vulkan/vulkan_core.h
-          test -f /opt/Vulkan-Headers/include/vk_video/vulkan_video_codecs_common.h
+          test -f /opt/nvk-switch/include/vk_video/vulkan_video_codecs_common.h
+          grep -q '^mesa_version=26.1.4$' /opt/nvk-switch/BUILD-MANIFEST.txt
+          grep -q '^vulkan_header_version=354$' /opt/nvk-switch/BUILD-MANIFEST.txt
+          grep -q '^nxvk_commit=69ec283dbda64e65347a36274efb349122e85363$' /opt/nvk-switch/BUILD-MANIFEST.txt
+          (cd /opt/nvk-switch && sha256sum -c SHA256SUMS)
 
       - name: Preflight
         run: |
           make preflight \
-            NVK_SWITCH_ROOT=/opt/nvk-switch \
-            VULKAN_HEADERS_ROOT=/opt/Vulkan-Headers
+            NVK_SWITCH_ROOT=/opt/nvk-switch
         env:
           DEVKITPRO: /opt/devkitpro
           DEVKITA64: /opt/devkitpro/devkitA64
@@ -67,8 +59,7 @@ jobs:
       - name: Build
         run: |
           make -j"$(nproc)" \
-            NVK_SWITCH_ROOT=/opt/nvk-switch \
-            VULKAN_HEADERS_ROOT=/opt/Vulkan-Headers
+            NVK_SWITCH_ROOT=/opt/nvk-switch
         env:
           DEVKITPRO: /opt/devkitpro
           DEVKITA64: /opt/devkitpro/devkitA64
@@ -76,15 +67,34 @@ jobs:
       - name: Check loaderless Vulkan ABI
         run: |
           make check-loaderless-abi \
-            NVK_SWITCH_ROOT=/opt/nvk-switch \
-            VULKAN_HEADERS_ROOT=/opt/Vulkan-Headers
+            NVK_SWITCH_ROOT=/opt/nvk-switch
         env:
           DEVKITPRO: /opt/devkitpro
           DEVKITA64: /opt/devkitpro/devkitA64
 
+      - name: Package experimental artifact
+        run: |
+          set -eux
+          OUT="$GITHUB_WORKSPACE/artifact"
+          mkdir -p "$OUT/licenses"
+          cp genshinimpact_nx.nro genshinimpact_nx.elf "$OUT/"
+          cp LICENSE "$OUT/licenses/genshinimpact_nx-LICENSE"
+          cp -r /opt/nvk-switch/licenses/. "$OUT/licenses/"
+          {
+            echo 'artifact=genshinimpact_nx-client-1234-nvk-26.1.4'
+            echo "genshin_commit=$GITHUB_SHA"
+            cat /opt/nvk-switch/BUILD-MANIFEST.txt
+            echo 'sdk_archive_sha256=c4682dbbe252cee9d22f98863786d71faa6a3b8a9d7db94e53929b2ab698f43d'
+            echo 'sdk_release=https://github.com/rulled/nvk-switch/releases/tag/mesa-26.1.4-nxvk-69ec283-r1'
+          } > "$OUT/BUILD-MANIFEST.txt"
+          strings genshinimpact_nx.nro | grep -E 'Mesa 26\.1\.4|26\.1\.4' | sort -u > "$OUT/MESA-VERSION-STRINGS.txt" || true
+          (cd "$OUT" && sha256sum genshinimpact_nx.nro genshinimpact_nx.elf > SHA256SUMS)
+          BAD=$(find "$OUT" -type f | grep -iE '\.(so|apk|obb|xapk|pack|dat)$|dump\.cs|global-metadata' || true)
+          test -z "$BAD"
+
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: genshinimpact_nx
-          path: genshinimpact_nx.nro
+          name: genshinimpact_nx-client-1234-nvk-26.1.4
+          path: artifact/
           if-no-files-found: error
