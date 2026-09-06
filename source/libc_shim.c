@@ -2815,24 +2815,56 @@ static Result oc_backing_map_locked(void *destination, size_t size,
 }
 
 /* One-shot diagnostic for the first code-alias unmap failure.  Write the
- * destination's queried memory state straight to fd 2 (stderr.txt) so the data
- * survives without allocating or re-entering the broker lock. */
+ * destination's and source's queried memory states plus every arena base
+ * straight to fd 2 (stderr.txt) so the data survives without allocating or
+ * re-entering the broker lock.  The bases classify the destination: a dst
+ * outside every managed range means stale/corrupt bookkeeping; a dst whose
+ * state is not AliasCode* means the VA was reclaimed by someone else (e.g. an
+ * nvdrv/WSI buffer with attr DeviceShared) or was already released. */
 static void oc_backing_unmap_diag_once(void *destination, size_t size,
                                        void *source_address,
                                        Result unmap_result) {
   static _Atomic int once = 0;
   if (__atomic_exchange_n(&once, 1, __ATOMIC_ACQ_REL)) return;
-  MemoryInfo mi;
-  u32 pi = 0;
-  Result q = svcQueryMemory(&mi, &pi, (u64)destination);
-  char buf[256];
+  MemoryInfo dst_info;
+  u32 dst_page_info = 0;
+  Result q = svcQueryMemory(&dst_info, &dst_page_info, (u64)destination);
+  MemoryInfo src_info;
+  u32 src_page_info = 0;
+  memset(&src_info, 0, sizeof(src_info));
+  Result sq = MAKERESULT(Module_Libnx, LibnxError_BadInput);
+  if (source_address)
+    sq = svcQueryMemory(&src_info, &src_page_info, (u64)source_address);
+  const uintptr_t dst_addr = (uintptr_t)destination;
+  const uintptr_t donor_base = (uintptr_t)g_heap_donor_base;
+  const char *dst_region = "none";
+  if (oc_base &&
+      dst_addr >= (uintptr_t)oc_base &&
+      dst_addr < (uintptr_t)oc_base + oc_alias_layout_bytes)
+    dst_region = "layout";
+  if (donor_base &&
+      dst_addr >= donor_base &&
+      dst_addr < donor_base + g_heap_donor_capacity)
+    dst_region = "donor";
+  char buf[512];
   int n = snprintf(buf, sizeof buf,
     "backing_unmap_fail dst=%p src=%p size=0x%zx unmap=0x%08x "
-    "query=0x%08x dst[addr=0x%lx size=0x%lx type=%u perm=0x%x attr=0x%x ip=0x%x]\n",
+    "query=0x%08x dst[addr=0x%lx size=0x%lx type=%u perm=0x%x attr=0x%x "
+    "ip=0x%x] region=%s srcq=0x%08x src[addr=0x%lx size=0x%lx type=%u "
+    "perm=0x%x attr=0x%x] bases[layout=%p layout_bytes=%zx dynamic=%p "
+    "pages=%zx donor=%p cap=%zx]\n",
     destination, source_address, size,
     (unsigned)unmap_result, (unsigned)q,
-    (unsigned long)mi.addr, (unsigned long)mi.size,
-    (unsigned)mi.type, (unsigned)mi.perm, (unsigned)mi.attr, (unsigned)pi);
+    (unsigned long)dst_info.addr, (unsigned long)dst_info.size,
+    (unsigned)dst_info.type, (unsigned)dst_info.perm,
+    (unsigned)dst_info.attr, (unsigned)dst_page_info, dst_region,
+    (unsigned)sq,
+    (unsigned long)src_info.addr, (unsigned long)src_info.size,
+    (unsigned)src_info.type, (unsigned)src_info.perm,
+    (unsigned)src_info.attr,
+    oc_base, oc_alias_layout_bytes, oc_dynamic_base,
+    (size_t)oc_dynamic_pages * MMAP_PAGE,
+    g_heap_donor_base, g_heap_donor_capacity);
   if (n > 0) (void)write(2, buf, (size_t)(n < (int)sizeof buf ? n : (int)sizeof buf - 1));
 }
 
@@ -2843,6 +2875,19 @@ static Result oc_backing_unmap_locked(void *destination, size_t size,
   if (g_memory_backing_backend != NX_MEMORY_BACKEND_HEAP_ALIAS ||
       !source || size % OC_HEAP_DONOR_UNIT_BYTES != 0)
     return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+  /* Every code-alias destination lives inside the alias layout reservation.
+   * A destination outside it is bookkeeping corruption; handing that address
+   * to svcUnmapProcessCodeMemory would at best leak the donor pages and at
+   * worst tear down a live alias.  Fail closed with the one-shot diagnostic. */
+  const uintptr_t unmap_addr = (uintptr_t)destination;
+  if (!oc_base || oc_alias_layout_bytes > UINTPTR_MAX - (uintptr_t)oc_base ||
+      unmap_addr < (uintptr_t)oc_base ||
+      unmap_addr >= (uintptr_t)oc_base + oc_alias_layout_bytes) {
+    __atomic_add_fetch(&oc_backing_unmap_fail, 1, __ATOMIC_RELAXED);
+    oc_backing_unmap_diag_once(destination, size, NULL,
+      MAKERESULT(Module_Libnx, LibnxError_BadInput));
+    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+  }
   uint8_t *source_address = oc_donor_source_from_encoded(source);
   if (!source_address)
     return MAKERESULT(Module_Libnx, LibnxError_BadInput);

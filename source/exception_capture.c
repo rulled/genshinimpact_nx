@@ -145,14 +145,28 @@ void __libnx_exception_handler(ThreadExceptionDump *context) {
    * the host broker spill, and the raw donor/pool residency. */
   NxSparseArenaDiagnostics diag = {0};
   nx_sparse_arena_get_diagnostics(&diag);
+  /* pool_free/largest_free == UINT64_MAX is the "broker busy" sentinel from
+   * the try-lock-free heartbeat snapshot, not a real size; print BUSY so the
+   * dump does not show a bogus 16-exabyte MiB value. */
+  char pool_free_text[16];
+  char largest_text[16];
+  if (diag.pool_free_bytes == UINT64_MAX)
+    snprintf(pool_free_text, sizeof pool_free_text, "BUSY");
+  else
+    snprintf(pool_free_text, sizeof pool_free_text, "%lluMiB",
+             NX_EXC_MIB(diag.pool_free_bytes));
+  if (diag.pool_largest_free_bytes == UINT64_MAX)
+    snprintf(largest_text, sizeof largest_text, "BUSY");
+  else
+    snprintf(largest_text, sizeof largest_text, "%lluMiB",
+             NX_EXC_MIB(diag.pool_largest_free_bytes));
   fprintf(file,
           "pool backend=%u committed=%lluMiB peak_committed=%lluMiB "
-          "pool_free=%lluMiB largest_free=%lluMiB\n",
+          "pool_free=%s largest_free=%s\n",
           diag.backing_backend,
           NX_EXC_MIB(diag.committed_bytes),
           NX_EXC_MIB(diag.peak_committed_bytes),
-          NX_EXC_MIB(diag.pool_free_bytes),
-          NX_EXC_MIB(diag.pool_largest_free_bytes));
+          pool_free_text, largest_text);
   fprintf(file,
           "spill guest=%lluMiB/peak=%lluMiB host=%lluMiB/peak=%lluMiB "
           "thread=%lluMiB/peak=%lluMiB\n",
