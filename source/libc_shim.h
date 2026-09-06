@@ -278,6 +278,9 @@ int nx_sparse_pool_spill_query(const void *pointer, size_t *requested_out,
 /* Host pointers are routed by the linker broker; thread backing is released
  * only after join restores its temporarily borrowed source pages. */
 void *nx_sparse_pool_host_alloc_aligned(size_t size, size_t alignment);
+/* dlmalloc arena extensions: allocated with a dedicated owner that every
+ * release path refuses to recycle (the pages back live heap chunks). */
+void *nx_sparse_pool_sbrk_alloc_aligned(size_t size, size_t alignment);
 void *nx_sparse_pool_thread_alloc(size_t size);
 int nx_sparse_pool_thread_release(void *pointer);
 int nx_sparse_pool_owned_release(void *pointer);

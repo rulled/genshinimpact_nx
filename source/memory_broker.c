@@ -20,6 +20,7 @@
 #include "config.h"
 #include "libc_shim.h"
 #include "memory_broker.h"
+#include "sbrk_extend.h"
 
 void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
@@ -257,6 +258,17 @@ void *__wrap_calloc(size_t count, size_t size) {
 
 void __wrap_free(void *pointer) {
   if (!pointer) return;
+  /* dlmalloc arena extensions are pinned: interior chunks stay dlmalloc-owned
+   * (native free), the raw base is never a valid user pointer.  These checks
+   * must precede the pool paths - a wildcard owned_release would recycle live
+   * arena pages. */
+  const SbrkExtensionClass sbrk_class = sbrk_extension_class(pointer);
+  if (sbrk_class == SBRK_EXTENSION_CLASS_BASE) return;
+  if (sbrk_class == SBRK_EXTENSION_CLASS_INTERIOR) {
+    hist_live_remove(pointer);
+    __real_free(pointer);
+    return;
+  }
   if (nx_sparse_pool_owned_release(pointer)) return;
   /* Query/release deliberately fail closed while the current thread owns the
    * pool lock, and a live native stack makes its source temporarily non-RW.
@@ -269,23 +281,35 @@ void __wrap_free(void *pointer) {
 void *__wrap_realloc(void *pointer, size_t size) {
   if (!pointer) return __wrap_malloc(size);
 
-  size_t pool_usable = 0;
-  if (nx_sparse_pool_owned_query(pointer, NULL, &pool_usable)) {
-    if (!size) {
-      (void)nx_sparse_pool_owned_release(pointer);
-      return NULL;
-    }
-    if (size <= pool_usable) return pointer;
-    void *replacement = __wrap_malloc(size);
-    if (!replacement) return NULL;
-    memcpy(replacement, pointer, pool_usable < size ? pool_usable : size);
-    (void)nx_sparse_pool_owned_release(pointer);
-    return replacement;
-  }
-  if (nx_sparse_pool_contains_address(pointer)) {
+  const SbrkExtensionClass sbrk_class = sbrk_extension_class(pointer);
+  if (sbrk_class == SBRK_EXTENSION_CLASS_BASE) {
+    /* dlmalloc never hands out the raw extension base; treat as caller bug
+     * without touching either allocator. */
     errno = ENOMEM;
     return NULL;
   }
+  if (sbrk_class == SBRK_EXTENSION_CLASS_NONE) {
+    size_t pool_usable = 0;
+    if (nx_sparse_pool_owned_query(pointer, NULL, &pool_usable)) {
+      if (!size) {
+        (void)nx_sparse_pool_owned_release(pointer);
+        return NULL;
+      }
+      if (size <= pool_usable) return pointer;
+      void *replacement = __wrap_malloc(size);
+      if (!replacement) return NULL;
+      memcpy(replacement, pointer, pool_usable < size ? pool_usable : size);
+      (void)nx_sparse_pool_owned_release(pointer);
+      return replacement;
+    }
+    if (nx_sparse_pool_contains_address(pointer)) {
+      errno = ENOMEM;
+      return NULL;
+    }
+  }
+  /* SBRK interior pointers fall through to the native path: the bytes stay
+   * dlmalloc-owned, and the large-threshold migration below frees the dlmalloc
+   * chunk inside the pinned extension - a normal dlmalloc operation. */
 
   if (!size) {
     hist_live_remove(pointer);
@@ -423,6 +447,12 @@ int __wrap_posix_memalign(void **result_out, size_t alignment, size_t size) {
 }
 
 size_t __wrap_malloc_usable_size(void *pointer) {
+  if (pointer) {
+    const SbrkExtensionClass sbrk_class = sbrk_extension_class(pointer);
+    if (sbrk_class == SBRK_EXTENSION_CLASS_INTERIOR)
+      return __real_malloc_usable_size(pointer);
+    if (sbrk_class == SBRK_EXTENSION_CLASS_BASE) return 0;
+  }
   size_t usable = 0;
   if (nx_sparse_pool_owned_query(pointer, NULL, &usable)) return usable;
   if (nx_sparse_pool_contains_address(pointer)) return 0;

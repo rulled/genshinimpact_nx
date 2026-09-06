@@ -2216,6 +2216,11 @@ typedef enum {
   OC_POOL_OWNER_GUEST,
   OC_POOL_OWNER_HOST,
   OC_POOL_OWNER_THREAD,
+  /* dlmalloc arena extensions borrowed by __wrap__sbrk_r.  Pinned for the
+   * process lifetime: dlmalloc fences chunks inside these pages, so any
+   * release path that handed them back to the pool would corrupt live heap
+   * chunks (observed as _free_r unlink faults through recycled arena pages). */
+  OC_POOL_OWNER_SBRK,
 } OcPoolOwner;
 
 /* Ownership is indexed by the allocation's exact virtual start instead of a
@@ -3241,7 +3246,7 @@ static int oc_pool_owned_lookup_locked(
     if (!record->pages || record->pages > oc_dynamic_pages - first ||
         !record->requested || record->requested > usable ||
         record->owner < OC_POOL_OWNER_GUEST ||
-        record->owner > OC_POOL_OWNER_THREAD)
+        record->owner > OC_POOL_OWNER_SBRK)
       return 0;
     if (view) {
       view->first = first;
@@ -3288,6 +3293,13 @@ static int oc_pool_owned_release(void *pointer, OcPoolOwner expected_owner) {
     return 0;
   }
   const OcPoolOwner owner = allocation.owner;
+  if (owner == OC_POOL_OWNER_SBRK) {
+    /* Arena extensions are never reclaimable.  Returning 0 (not released)
+     * makes callers fall through to the range checks, which contain the
+     * pointer instead of forwarding it to newlib free. */
+    mmap_broker_unlock();
+    return 0;
+  }
   const size_t first = allocation.first;
   const size_t pages = allocation.pages;
   /* A libnx caller-owned stack temporarily borrows its source pages.  Never
@@ -3582,6 +3594,10 @@ void *nx_sparse_pool_spill_alloc_aligned(size_t size, size_t alignment) {
 
 void *nx_sparse_pool_host_alloc_aligned(size_t size, size_t alignment) {
   return oc_pool_owned_alloc(size, alignment, OC_POOL_OWNER_HOST);
+}
+
+void *nx_sparse_pool_sbrk_alloc_aligned(size_t size, size_t alignment) {
+  return oc_pool_owned_alloc(size, alignment, OC_POOL_OWNER_SBRK);
 }
 
 void *nx_sparse_pool_thread_alloc(size_t size) {
