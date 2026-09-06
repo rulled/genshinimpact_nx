@@ -110,6 +110,8 @@ typedef struct {
   uint64_t size_query_failures;
   uint64_t size_extensions;
   uint64_t size_extension_failures;
+  uint64_t size_cache_stale;
+  uint64_t size_cache_resets;
   uint64_t preallocation_extensions;
   uint64_t preallocation_fallbacks;
   uint64_t preallocated_bytes;

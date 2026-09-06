@@ -746,6 +746,7 @@ static unsigned char *nx_fs_transfer_page(void) {
 typedef struct {
   Mutex lock;
   NxFsdevFile *file;
+  uint32_t file_session;
   int64_t logical_size;
   int64_t physical_size;
   char path[NX_FS_TRACKED_PATH];
@@ -870,14 +871,27 @@ static NxTrackedFileSize *nx_file_size_acquire(NxFsdevFile *file,
                                                 int create,
                                                 int bulk_eligible) {
   if (!file) return NULL;
+  /* fsdev recycles fileStruct pointers, and files closed through the plain
+   * newlib devoptab close (every fopen/fclose inside this NRO) never run
+   * nx_file_io_finalize_fd.  A surviving entry is only trustworthy while the
+   * underlying FsFile session handle still matches: a recycled pointer with a
+   * different session proves the cached sizes belong to a previous open
+   * instance.  Without this check a new writable file could append at the
+   * previous file's logical size and fail every read-back verification. */
+  const uint32_t session = file->file.s.session;
   mutexLock(&g_file_size_registry_lock);
   NxTrackedFileSize *entry = NULL;
   NxTrackedFileSize *free_entry = NULL;
   for (unsigned i = 0; i < NX_FS_TRACKED_FILES; ++i) {
     NxTrackedFileSize *candidate = &g_file_sizes[i];
     if (candidate->used && candidate->file == file) {
-      entry = candidate;
-      break;
+      if (candidate->file_session == session) {
+        entry = candidate;
+        break;
+      }
+      FILE_IO_ADD(size_cache_stale, 1);
+      if (!candidate->acquisitions && !free_entry) free_entry = candidate;
+      continue;
     }
     if (!candidate->used && !candidate->acquisitions && !free_entry)
       free_entry = candidate;
@@ -887,6 +901,7 @@ static NxTrackedFileSize *nx_file_size_acquire(NxFsdevFile *file,
     /* acquisitions == 0 guarantees no owner or waiter can hold this lock. */
     mutexLock(&entry->lock);
     entry->file = file;
+    entry->file_session = session;
     entry->logical_size = 0;
     entry->physical_size = 0;
     entry->path[0] = '\0';
@@ -942,9 +957,23 @@ void nx_file_io_track_open(int fd, const char *path, int writable) {
     !strncmp(path, GAME_HOME "/files", root_length) &&
     (path[root_length] == '/' || path[root_length] == '\0');
   NxTrackedFileSize *entry = nx_file_size_acquire(file, 1, bulk_eligible);
-  if (entry && !entry->path[0])
-    snprintf(entry->path, sizeof entry->path, "%s", path);
-  nx_file_size_release(entry);
+  if (entry) {
+    if (!entry->path[0]) {
+      snprintf(entry->path, sizeof entry->path, "%s", path);
+    } else if (strcmp(entry->path, path) != 0) {
+      /* Same fileStruct pointer and session handle as a different writable
+       * path: the kernel recycled both after a close that skipped finalize.
+       * Drop the cached sizes so the next write re-queries the real file
+       * size instead of appending at the previous file's end. */
+      FILE_IO_ADD(size_cache_resets, 1);
+      entry->logical_size = 0;
+      entry->physical_size = 0;
+      entry->initialized = 0;
+      snprintf(entry->path, sizeof entry->path, "%s", path);
+    }
+    if (bulk_eligible) entry->bulk_eligible = 1;
+    nx_file_size_release(entry);
+  }
   errno = saved_errno;
 }
 
@@ -1035,6 +1064,7 @@ void nx_file_io_finalize_fd(int fd) {
   mutexLock(&g_file_size_registry_lock);
   entry->used = 0;
   entry->file = NULL;
+  entry->file_session = 0;
   entry->initialized = 0;
   entry->bulk_eligible = 0;
   entry->path[0] = '\0';

@@ -2723,6 +2723,7 @@ int main(int argc, char **argv) {
         fprintf(lf,
                 "[I] fio: rd=%lluB/%llu fail=%llu wr=%lluB/%llu fail=%llu "
                 "size=q%llu/h%llu/qfail%llu/ext%llu/efail%llu "
+                "stale=%llu rst=%llu "
                 "direct=%llu/%llu bounce=%lluB/%llu\n",
                 (unsigned long long)fio.read_bytes,
                 (unsigned long long)fio.read_calls,
@@ -2735,6 +2736,8 @@ int main(int argc, char **argv) {
                 (unsigned long long)fio.size_query_failures,
                 (unsigned long long)fio.size_extensions,
                 (unsigned long long)fio.size_extension_failures,
+                (unsigned long long)fio.size_cache_stale,
+                (unsigned long long)fio.size_cache_resets,
                 (unsigned long long)fio.direct_writes,
                 (unsigned long long)fio.direct_write_failures,
                 (unsigned long long)fio.bounce_bytes,
