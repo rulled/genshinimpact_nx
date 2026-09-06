@@ -68,7 +68,7 @@ void *__real__sbrk_r(struct _reent *reent, ptrdiff_t incr);
  * SBRK_EXTENSION_MAX_RANGES must be >= TOTAL_MAX / BLOCK_MIN (the registry
  * below denies extensions once its slots run out, which can only happen past
  * the budget cap anyway). */
-#define SBRK_EXTENSION_TOTAL_MAX ((size_t)256 * 1024 * 1024)
+#define SBRK_EXTENSION_TOTAL_MAX ((size_t)512 * 1024 * 1024)
 
 #define SBRK_EXTENSION_MAX_RANGES 64u
 

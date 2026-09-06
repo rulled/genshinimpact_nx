@@ -2704,7 +2704,8 @@ int main(int argc, char **argv) {
         fprintf(lf,
                 "[I] mem: cap=%lluM head=%lluM pool_free=%lluB "
                 "map=%llu last=0x%x fio_active=%llu oldest=%llums "
-                "slot=%u kind=%u fin=%llu/%llu\n",
+                "slot=%u kind=%u fin=%llu/%llu "
+                "sbrk=%lu ext=%luM denied=%lu\n",
                 donor_cap, donor_head,
                 (pool_free == UINT64_MAX) ? UINT64_MAX : pool_free,
                 (unsigned long long)diag.map_call_count,
@@ -2715,7 +2716,10 @@ int main(int argc, char **argv) {
                   ? 0u : fio.oldest_size_operation_slot,
                 fio.oldest_size_operation_kind,
                 (unsigned long long)fio.finalize_calls,
-                (unsigned long long)fio.finalize_failures);
+                (unsigned long long)fio.finalize_failures,
+                g_sbrk_extension_count,
+                g_sbrk_extension_bytes / (1024ul * 1024ul),
+                g_sbrk_extension_denied);
         fprintf(lf,
                 "[I] fio: rd=%lluB/%llu fail=%llu wr=%lluB/%llu fail=%llu "
                 "size=q%llu/h%llu/qfail%llu/ext%llu/efail%llu "

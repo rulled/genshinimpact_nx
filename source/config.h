@@ -32,8 +32,12 @@
  * allocations (open_memstream, FILE glue) bypass every wrapper and die with
  * ENOMEM once dlmalloc saturates, so the primary heap must stay small.
  * Histogram data from the login-burst NAK panic showed 472 MiB peak-live in
- * dlmalloc, with 465 MiB in >=16 MiB blocks while the pool held GiBs free. */
-#define OC_BROKER_LARGE_ALLOC_BYTES ((size_t)1 * 1024 * 1024)
+ * dlmalloc, with 465 MiB in >=16 MiB blocks while the pool held GiBs free.
+ * The shader warmup burst (thousands of live pipelines) then ratcheted
+ * dlmalloc's arena through 64 KiB-1 MiB blocks into the sbrk-extension cap
+ * while the donor/pool still held GiBs free (crash-3), so the threshold now
+ * routes every mid-size block to the recyclable pool as well. */
+#define OC_BROKER_LARGE_ALLOC_BYTES ((size_t)64 * 1024)
 
 #define SS_PACKAGE        "com.miHoYo.GenshinImpact"
 #define SS_VERSION_CODE   1234
