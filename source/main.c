@@ -2174,6 +2174,50 @@ void abort(void) {
     fprintf(f, "il2cpp_base=0x%lx il2cpp_size=0x%lx\n",
             (unsigned long)g_il2cpp_base,
             (unsigned long)g_il2cpp_size);
+    /* Allocator state first, flushed immediately: a Rust panic abort during
+     * the login shader-warmup burst dies with dlmalloc saturated and the
+     * broker lock contended, so the reporters after the stack scan (panic
+     * capture, vk report) may never complete.  Donor exhaustion vs dlmalloc
+     * residency in this block is what distinguishes a ceiling abort
+     * (crash-3 class) from a wrapper bug. */
+    {
+      NxSparseArenaDiagnostics diag = {0};
+      nx_sparse_arena_get_diagnostics(&diag);
+      const unsigned long long MiB = 1024ull * 1024ull;
+      fprintf(f,
+              "pool backend=%u committed=%lluMiB peak_committed=%lluMiB "
+              "pool_free=%lluMiB largest_free=%lluMiB\n",
+              diag.backing_backend,
+              diag.committed_bytes / MiB,
+              diag.peak_committed_bytes / MiB,
+              diag.pool_free_bytes / MiB,
+              diag.pool_largest_free_bytes / MiB);
+      fprintf(f,
+              "donor cap=%lluMiB active=%lluMiB used=%lluMiB/peak=%lluMiB "
+              "grow=%llu shrink=%llu last_resize=0x%x\n",
+              diag.donor_capacity_bytes / MiB,
+              diag.donor_active_bytes / MiB,
+              diag.donor_used_bytes / MiB,
+              diag.donor_peak_used_bytes / MiB,
+              (unsigned long long)diag.donor_grow_calls,
+              (unsigned long long)diag.donor_shrink_calls,
+              diag.donor_last_resize_result);
+      fprintf(f,
+              "alloc_failures guest=%llu host=%llu thread=%llu "
+              "dynamic_mapped=%lluMiB/peak=%lluMiB last_map=0x%x\n",
+              (unsigned long long)diag.guest_allocation_failures,
+              (unsigned long long)diag.host_allocation_failures,
+              (unsigned long long)diag.thread_allocation_failures,
+              diag.dynamic_mapped_bytes / MiB,
+              diag.peak_dynamic_mapped_bytes / MiB,
+              diag.last_map_result);
+      fprintf(f, "backing_unmap ok=%llu fail=%llu\n",
+              (unsigned long long)diag.backing_unmap_ok,
+              (unsigned long long)diag.backing_unmap_fail);
+    }
+    sbrk_extension_report(f);
+    memory_broker_histogram_report(f);
+    fflush(f);
 
     extern void _start(void);
     extern char __bss_end__[];
@@ -2217,45 +2261,9 @@ void abort(void) {
         fprintf(f, "\n");
       }
     }
+    fflush(f);
     panic_capture_report(f);
     nx_vk_report(f);
-    {
-      NxSparseArenaDiagnostics diag = {0};
-      nx_sparse_arena_get_diagnostics(&diag);
-      const unsigned long long MiB = 1024ull * 1024ull;
-      fprintf(f,
-              "pool backend=%u committed=%lluMiB peak_committed=%lluMiB "
-              "pool_free=%lluMiB largest_free=%lluMiB\n",
-              diag.backing_backend,
-              diag.committed_bytes / MiB,
-              diag.peak_committed_bytes / MiB,
-              diag.pool_free_bytes / MiB,
-              diag.pool_largest_free_bytes / MiB);
-      fprintf(f,
-              "donor cap=%lluMiB active=%lluMiB used=%lluMiB/peak=%lluMiB "
-              "grow=%llu shrink=%llu last_resize=0x%x\n",
-              diag.donor_capacity_bytes / MiB,
-              diag.donor_active_bytes / MiB,
-              diag.donor_used_bytes / MiB,
-              diag.donor_peak_used_bytes / MiB,
-              (unsigned long long)diag.donor_grow_calls,
-              (unsigned long long)diag.donor_shrink_calls,
-              diag.donor_last_resize_result);
-      fprintf(f,
-              "alloc_failures guest=%llu host=%llu thread=%llu "
-              "dynamic_mapped=%lluMiB/peak=%lluMiB last_map=0x%x\n",
-              (unsigned long long)diag.guest_allocation_failures,
-              (unsigned long long)diag.host_allocation_failures,
-              (unsigned long long)diag.thread_allocation_failures,
-              diag.dynamic_mapped_bytes / MiB,
-              diag.peak_dynamic_mapped_bytes / MiB,
-              diag.last_map_result);
-      fprintf(f, "backing_unmap ok=%llu fail=%llu\n",
-              (unsigned long long)diag.backing_unmap_ok,
-              (unsigned long long)diag.backing_unmap_fail);
-    }
-    sbrk_extension_report(f);
-    memory_broker_histogram_report(f);
     fflush(f);
     fclose(f);
   }

@@ -10,8 +10,16 @@
  * memory use svcMapPhysicalMemory directly.  Ordinary hbloader forwarders have
  * a zero SystemResourceSize, so the wrapper instead grows a private heap-donor
  * suffix on demand and donates those pages through the same reversible
- * self-process code alias used by the NRO loader. */
-#define OC_MANAGED_BYTES    ((size_t)1024 * 1024 * 1024)
+ * self-process code alias used by the NRO loader.  256 MiB is post-df19dbf
+ * reality: >=64KiB public allocations route to the reclaimable pool, so
+ * dlmalloc's live residency is small (sub-64KiB live <1MiB per the broker
+ * histogram) and overflow uses the pinned sbrk-extension path (4 MiB pool
+ * blocks, 512 MiB cap).  The freed fixed-heap budget becomes heap-donor
+ * capacity (~2258 MiB on a 2930 MiB hbloader grant instead of 1490 MiB),
+ * which is what the login shader-warmup burst exhausts otherwise (crash-3:
+ * donor hit its 1490 MiB ceiling at PrecompileShaders, three NAK ENOMEM
+ * panics at from_nir.rs:338). */
+#define OC_MANAGED_BYTES    ((size_t)256 * 1024 * 1024)
 /* The port requires a 39-bit process.  Its shared sparse/dynamic arena is
  * larger than the complete heap-donor backing budget, so the old virtual
  * ceiling cannot precede real donor/process admission.  This is an address-
