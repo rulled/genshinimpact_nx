@@ -11,6 +11,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <switch.h>
 
 #include "config.h"
@@ -314,6 +315,269 @@ static void forget_memory(VkDevice device, VkDeviceMemory memory) {
   NxVkMemoryRecord *record = find_memory_record(device, memory);
   if (record) memset(record, 0, sizeof(*record));
   records_unlock();
+}
+
+/* ---- Persistent pipeline cache ---- */
+
+/* The game reports VulkanPipelineCacheSize()=0 every boot, so its shader
+ * warmup recompiles thousands of pipelines from scratch and the 3 NAK
+ * compiler threads once exhausted the heap donor (nak/from_nir.rs panic,
+ * OOM abort).  Persist the driver's own VkPipelineCache contents on SD and
+ * replay them as pInitialData at creation.  The header pins the blob to the
+ * driver build: NVK's serialized pipeline format changes with Mesa, and
+ * pipelineCacheUUID is the driver's own compatibility token. */
+#define NX_VK_PIPELINE_CACHE_PATH     GAME_HOME "/cache/pipeline_cache.bin"
+#define NX_VK_PIPELINE_CACHE_TMP_PATH GAME_HOME "/cache/pipeline_cache.bin.tmp"
+#define NX_VK_PIPELINE_CACHE_MAGIC    0x4e585043u /* 'NXPC' */
+#define NX_VK_PIPELINE_CACHE_VERSION  1u
+#define NX_VK_PIPELINE_CACHE_MAX_DUMP (64u * 1024u * 1024u)
+#define NX_VK_PIPELINE_CACHE_CAPACITY 8
+
+typedef struct {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t driver_version;
+  uint32_t blob_size;
+  uint8_t cache_uuid[VK_UUID_SIZE];
+} NxVkPipelineCacheHeader;
+
+typedef struct {
+  VkDevice device;
+  VkPipelineCache cache;
+  size_t size_hint;
+} NxVkPipelineCacheRecord;
+
+static NxVkPipelineCacheRecord
+  g_pipeline_cache_records[NX_VK_PIPELINE_CACHE_CAPACITY];
+static volatile unsigned char g_pipeline_cache_lock;
+static int g_pipeline_cache_overflow_logged;
+
+static void pipeline_cache_lock(void) {
+  while (__atomic_test_and_set(&g_pipeline_cache_lock, __ATOMIC_ACQUIRE))
+    svcSleepThread(0);
+}
+
+static void pipeline_cache_unlock(void) {
+  __atomic_clear(&g_pipeline_cache_lock, __ATOMIC_RELEASE);
+}
+
+/* Identity of the running NVK build.  Fails only before the instance exists,
+ * where there is nothing to load or dump anyway. */
+static int pipeline_cache_driver_identity(uint32_t *driver_version,
+                                          uint8_t *cache_uuid) {
+  const VkInstance instance = __atomic_load_n(&g_bridge_instance,
+                                               __ATOMIC_ACQUIRE);
+  if (instance == VK_NULL_HANDLE) return 0;
+  PFN_vkEnumeratePhysicalDevices enumerate =
+    (PFN_vkEnumeratePhysicalDevices)driver_proc(
+      instance, "vkEnumeratePhysicalDevices");
+  PFN_vkGetPhysicalDeviceProperties get_properties =
+    (PFN_vkGetPhysicalDeviceProperties)driver_proc(
+      instance, "vkGetPhysicalDeviceProperties");
+  if (!enumerate || !get_properties) return 0;
+  VkPhysicalDevice devices[1];
+  uint32_t count = 1;
+  if (enumerate(instance, &count, devices) != VK_SUCCESS || count != 1)
+    return 0;
+  VkPhysicalDeviceProperties properties;
+  get_properties(devices[0], &properties);
+  *driver_version = properties.driverVersion;
+  memcpy(cache_uuid, properties.pipelineCacheUUID, VK_UUID_SIZE);
+  return 1;
+}
+
+/* Read the blob persisted by a previous boot.  Returns NULL (after deleting
+ * the file) whenever the header or contents cannot be trusted. */
+static void *pipeline_cache_load(size_t *blob_size) {
+  *blob_size = 0;
+  FILE *file = fopen(NX_VK_PIPELINE_CACHE_PATH, "rb");
+  if (!file) return NULL;
+  uint32_t driver_version = 0;
+  uint8_t cache_uuid[VK_UUID_SIZE];
+  NxVkPipelineCacheHeader header;
+  void *blob = NULL;
+  if (pipeline_cache_driver_identity(&driver_version, cache_uuid) &&
+      fread(&header, sizeof header, 1, file) == 1 &&
+      header.magic == NX_VK_PIPELINE_CACHE_MAGIC &&
+      header.version == NX_VK_PIPELINE_CACHE_VERSION &&
+      header.driver_version == driver_version &&
+      memcmp(header.cache_uuid, cache_uuid, VK_UUID_SIZE) == 0 &&
+      header.blob_size > 0 &&
+      header.blob_size <= NX_VK_PIPELINE_CACHE_MAX_DUMP) {
+    blob = malloc(header.blob_size);
+    if (blob && fread(blob, 1, header.blob_size, file) == header.blob_size) {
+      *blob_size = header.blob_size;
+      log_line("[VK] pipeline cache initial data %u bytes\n",
+               (unsigned)header.blob_size);
+    } else {
+      free(blob);
+      blob = NULL;
+    }
+  }
+  fclose(file);
+  if (!blob) {
+    remove(NX_VK_PIPELINE_CACHE_PATH);
+    log_line("[VK] pipeline cache file rejected and removed\n");
+  }
+  return blob;
+}
+
+/* Serialize one live cache to SD.  Skips silently when the driver reports
+ * nothing or beyond the dump cap. */
+static void pipeline_cache_dump_locked(VkDevice device,
+                                       VkPipelineCache cache) {
+  PFN_vkGetPipelineCacheData get_data =
+    (PFN_vkGetPipelineCacheData)device_proc(device,
+                                            "vkGetPipelineCacheData");
+  if (!get_data || cache == VK_NULL_HANDLE) return;
+  size_t buffer_size = 0;
+  if (get_data(device, cache, &buffer_size, NULL) != VK_SUCCESS ||
+      !buffer_size || buffer_size > NX_VK_PIPELINE_CACHE_MAX_DUMP)
+    return;
+  void *blob = malloc(buffer_size);
+  if (!blob) return;
+  size_t size = buffer_size;
+  const VkResult result = get_data(device, cache, &size, blob);
+  if (result != VK_SUCCESS || !size || size > buffer_size) {
+    free(blob);
+    return;
+  }
+  uint32_t driver_version = 0;
+  uint8_t cache_uuid[VK_UUID_SIZE];
+  if (!pipeline_cache_driver_identity(&driver_version, cache_uuid)) {
+    free(blob);
+    return;
+  }
+  NxVkPipelineCacheHeader header = {
+    .magic = NX_VK_PIPELINE_CACHE_MAGIC,
+    .version = NX_VK_PIPELINE_CACHE_VERSION,
+    .driver_version = driver_version,
+    .blob_size = (uint32_t)size,
+  };
+  memcpy(header.cache_uuid, cache_uuid, VK_UUID_SIZE);
+  FILE *file = fopen(NX_VK_PIPELINE_CACHE_TMP_PATH, "wb");
+  if (!file) {
+    free(blob);
+    return;
+  }
+  int ok = fwrite(&header, sizeof header, 1, file) == 1 &&
+           fwrite(blob, 1, size, file) == size &&
+           fflush(file) == 0 && fsync(fileno(file)) == 0;
+  if (fclose(file) != 0) ok = 0;
+  free(blob);
+  if (!ok) {
+    unlink(NX_VK_PIPELINE_CACHE_TMP_PATH);
+    return;
+  }
+  /* FAT does not consistently replace an existing destination. */
+  remove(NX_VK_PIPELINE_CACHE_PATH);
+  if (rename(NX_VK_PIPELINE_CACHE_TMP_PATH, NX_VK_PIPELINE_CACHE_PATH) == 0)
+    log_line("[VK] pipeline cache persisted %u bytes\n", (unsigned)size);
+  else
+    unlink(NX_VK_PIPELINE_CACHE_TMP_PATH);
+}
+
+/* Serialized: two caches dying concurrently must not interleave the tmp-file
+ * writes, and this also keeps the dump off the registry lock's fast path. */
+static void pipeline_cache_dump(VkDevice device, VkPipelineCache cache) {
+  pipeline_cache_lock();
+  pipeline_cache_dump_locked(device, cache);
+  pipeline_cache_unlock();
+}
+
+static void pipeline_cache_track(VkDevice device, VkPipelineCache cache,
+                                 size_t size_hint) {
+  if (cache == VK_NULL_HANDLE) return;
+  pipeline_cache_lock();
+  for (size_t i = 0; i < NX_VK_PIPELINE_CACHE_CAPACITY; ++i) {
+    if (g_pipeline_cache_records[i].cache != VK_NULL_HANDLE) continue;
+    g_pipeline_cache_records[i] = (NxVkPipelineCacheRecord){
+      .device = device,
+      .cache = cache,
+      .size_hint = size_hint,
+    };
+    pipeline_cache_unlock();
+    return;
+  }
+  pipeline_cache_unlock();
+  if (log_once(&g_pipeline_cache_overflow_logged))
+    log_line("[E] VK pipeline cache registry full; the boot cache will not "
+             "persist\n");
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL nx_vkCreatePipelineCache(
+    VkDevice device, const VkPipelineCacheCreateInfo *create_info,
+    const VkAllocationCallbacks *allocator, VkPipelineCache *cache) {
+  PFN_vkCreatePipelineCache create_cache =
+    (PFN_vkCreatePipelineCache)device_proc(device, "vkCreatePipelineCache");
+  if (!create_cache) return VK_ERROR_INITIALIZATION_FAILED;
+  if (!create_info || !cache || create_info->initialDataSize)
+    return create_cache(device, create_info, allocator, cache);
+  size_t blob_size = 0;
+  void *blob = pipeline_cache_load(&blob_size);
+  const VkPipelineCacheCreateInfo *passed = create_info;
+  VkPipelineCacheCreateInfo local;
+  if (blob) {
+    local = *create_info;
+    local.pInitialData = blob;
+    local.initialDataSize = blob_size;
+    passed = &local;
+  }
+  VkResult result = create_cache(device, passed, allocator, cache);
+  if (result != VK_SUCCESS && blob) {
+    /* The driver refused the injected blob despite a valid header; retry
+     * empty so the session is unaffected. */
+    result = create_cache(device, create_info, allocator, cache);
+    remove(NX_VK_PIPELINE_CACHE_PATH);
+  }
+  free(blob);
+  if (result == VK_SUCCESS)
+    pipeline_cache_track(device, *cache, blob_size);
+  return result;
+}
+
+static VKAPI_ATTR void VKAPI_CALL nx_vkDestroyPipelineCache(
+    VkDevice device, VkPipelineCache cache,
+    const VkAllocationCallbacks *allocator) {
+  PFN_vkDestroyPipelineCache destroy_cache =
+    (PFN_vkDestroyPipelineCache)device_proc(device,
+                                            "vkDestroyPipelineCache");
+  if (cache != VK_NULL_HANDLE) {
+    pipeline_cache_lock();
+    for (size_t i = 0; i < NX_VK_PIPELINE_CACHE_CAPACITY; ++i) {
+      if (g_pipeline_cache_records[i].cache != cache) continue;
+      memset(&g_pipeline_cache_records[i], 0,
+             sizeof g_pipeline_cache_records[i]);
+    }
+    pipeline_cache_unlock();
+    pipeline_cache_dump(device, cache);
+  }
+  if (destroy_cache) destroy_cache(device, cache, allocator);
+}
+
+static VKAPI_ATTR void VKAPI_CALL nx_vkDestroyDevice(
+    VkDevice device, const VkAllocationCallbacks *allocator) {
+  const VkInstance instance = __atomic_load_n(&g_bridge_instance,
+                                               __ATOMIC_ACQUIRE);
+  PFN_vkDestroyDevice destroy_device =
+    (PFN_vkDestroyDevice)driver_proc(instance, "vkDestroyDevice");
+  /* Dump every live cache for this device before the driver tears the
+   * device (and with it the caches) down. */
+  VkPipelineCache caches[NX_VK_PIPELINE_CACHE_CAPACITY];
+  size_t count = 0;
+  pipeline_cache_lock();
+  for (size_t i = 0; i < NX_VK_PIPELINE_CACHE_CAPACITY; ++i) {
+    if (g_pipeline_cache_records[i].device != device ||
+        g_pipeline_cache_records[i].cache == VK_NULL_HANDLE)
+      continue;
+    caches[count++] = g_pipeline_cache_records[i].cache;
+    memset(&g_pipeline_cache_records[i], 0,
+           sizeof g_pipeline_cache_records[i]);
+  }
+  pipeline_cache_unlock();
+  for (size_t i = 0; i < count; ++i)
+    pipeline_cache_dump(device, caches[i]);
+  if (destroy_device) destroy_device(device, allocator);
 }
 
 static void log_image_failure(VkResult result, const VkImageCreateInfo *ci) {
@@ -1132,6 +1396,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL nx_vkGetDeviceProcAddr(
     return (PFN_vkVoidFunction)&nx_vkCreateGraphicsPipelines;
   if (name && strcmp(name, "vkCreateComputePipelines") == 0)
     return (PFN_vkVoidFunction)&nx_vkCreateComputePipelines;
+  if (name && strcmp(name, "vkCreatePipelineCache") == 0)
+    return (PFN_vkVoidFunction)&nx_vkCreatePipelineCache;
+  if (name && strcmp(name, "vkDestroyPipelineCache") == 0)
+    return (PFN_vkVoidFunction)&nx_vkDestroyPipelineCache;
   return device_proc(device, name);
 }
 
@@ -1199,6 +1467,12 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL nx_vkGetInstanceProcAddr(
     return (PFN_vkVoidFunction)&nx_vkCreateGraphicsPipelines;
   if (strcmp(name, "vkCreateComputePipelines") == 0)
     return (PFN_vkVoidFunction)&nx_vkCreateComputePipelines;
+  if (strcmp(name, "vkCreatePipelineCache") == 0)
+    return (PFN_vkVoidFunction)&nx_vkCreatePipelineCache;
+  if (strcmp(name, "vkDestroyPipelineCache") == 0)
+    return (PFN_vkVoidFunction)&nx_vkDestroyPipelineCache;
+  if (strcmp(name, "vkDestroyDevice") == 0)
+    return (PFN_vkVoidFunction)&nx_vkDestroyDevice;
   return driver_proc(instance, name);
 }
 
@@ -1296,5 +1570,8 @@ void *nx_vk_lookup(const char *name) {
   if (strcmp(name, "vkCreateSwapchainKHR") == 0) return &nx_vkCreateSwapchainKHR;
   if (strcmp(name, "vkCreateGraphicsPipelines") == 0) return &nx_vkCreateGraphicsPipelines;
   if (strcmp(name, "vkCreateComputePipelines") == 0) return &nx_vkCreateComputePipelines;
+  if (strcmp(name, "vkCreatePipelineCache") == 0) return &nx_vkCreatePipelineCache;
+  if (strcmp(name, "vkDestroyPipelineCache") == 0) return &nx_vkDestroyPipelineCache;
+  if (strcmp(name, "vkDestroyDevice") == 0) return &nx_vkDestroyDevice;
   return (void *)driver_proc(VK_NULL_HANDLE, name);
 }

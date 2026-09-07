@@ -2353,6 +2353,12 @@ int main(int argc, char **argv) {
     putenv(abort_env);
   }
 
+  /* No MESA_SHADER_CACHE_* variables here on purpose: the pinned prebuilt NVK
+   * (jhuz0/nvk-switch mesa-25.0.7-r1) ships with Mesa's shader disk cache
+   * compiled out (no disk_cache_* symbols or cache-dir/max-size readers in
+   * libvulkan.a), so those variables are never read.  Cross-boot pipeline
+   * cache persistence happens in the bridge instead (vulkan_bridge.c). */
+
   startup_status_begin("Validating the Android client");
   if (chdir(DATA_ROOT) != 0)
     fatal_error("Could not enter %s. Copy the staged game directory to the SD card.",
