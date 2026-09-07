@@ -18,3 +18,6 @@ sd_bundle/
 
 # Generated from a physical Android device; may contain identifying values.
 tools/device_profile.ini
+
+# Claude Code agent worktrees and local settings
+.claude/
