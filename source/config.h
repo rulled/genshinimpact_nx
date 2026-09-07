@@ -87,8 +87,8 @@ int write_config(const char *file);
  * overrides hand the NRO a real duplicate of its own process handle;
  * launchers that do not (direct NRO loaders, emulators) leave the env
  * entry invalid, so fall back to the kernel's CUR_PROCESS pseudo-handle,
- * which every svc taking a process handle accepts.  Requires <switch.h>
- * to be included before this header. */
+ * which every svc taking a process handle accepts. */
+#include <switch.h>
 static inline Handle nx_own_process_handle(void) {
   Handle h = envGetOwnProcessHandle();
   return h == INVALID_HANDLE ? CUR_PROCESS_HANDLE : h;
