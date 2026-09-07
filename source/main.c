@@ -242,6 +242,29 @@ void __libnx_initheap(void) {
       g_heap_donor_capacity = OC_HEAP_DONOR_INITIAL_BYTES;
       g_heap_donor_active_bytes = OC_HEAP_DONOR_INITIAL_BYTES;
       g_heap_donor_kernel_offset = requested;
+      /* No hbloader override suffix exists on this path (direct NRO loaders
+       * and emulators hand the process a plain heap), so derive the donor
+       * ceiling from the process budget instead of pinning it to the initial
+       * suffix: the kernel heap may grow until the margin of the total grant
+       * remains for code, stacks, and driver allocations, and never past the
+       * heap address-space region. */
+      u64 total_memory = 0;
+      u64 heap_region_size = 0;
+      (void)svcGetInfo(&total_memory, InfoType_TotalMemorySize,
+                       CUR_PROCESS_HANDLE, 0);
+      (void)svcGetInfo(&heap_region_size, InfoType_HeapRegionSize,
+                       CUR_PROCESS_HANDLE, 0);
+      u64 budget = total_memory > OC_HEAP_DONOR_CEILING_MARGIN_BYTES
+        ? total_memory - OC_HEAP_DONOR_CEILING_MARGIN_BYTES : 0;
+      if (heap_region_size && heap_region_size < budget)
+        budget = heap_region_size;
+      if (budget >= (u64)target) {
+        size_t donor_capacity = (size_t)budget - requested;
+        donor_capacity &= ~(heap_quantum - 1u);
+        if (donor_capacity >= OC_HEAP_DONOR_INITIAL_BYTES &&
+            donor_capacity % OC_HEAP_DONOR_UNIT_BYTES == 0)
+          g_heap_donor_capacity = donor_capacity;
+      }
     }
     g_initial_heap_bytes = target;
     g_kernel_heap_bytes = target;

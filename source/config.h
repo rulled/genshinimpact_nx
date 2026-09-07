@@ -36,6 +36,11 @@
 #define OC_HEAP_DONOR_UNIT_BYTES    ((size_t)64 * 1024)
 #define OC_HEAP_DONOR_INITIAL_BYTES ((size_t)64 * 1024 * 1024)
 #define OC_HEAP_DONOR_GROW_BYTES    ((size_t)256 * 1024 * 1024)
+/* Launchers without an hbloader heap override (direct NRO loaders,
+ * emulators) grant the process a plain heap instead of a pre-split suffix,
+ * so the donor ceiling is derived from the total grant minus this margin
+ * left for code, stacks, and driver allocations. */
+#define OC_HEAP_DONOR_CEILING_MARGIN_BYTES ((size_t)256 * 1024 * 1024)
 #define OC_HEAP_DONOR_SHRINK_BYTES  OC_HEAP_DONOR_GROW_BYTES
 #define SO_REGION_BYTES     ((size_t) 416 * 1024 * 1024)
 /* Public host allocations at or above this size are served straight from the
