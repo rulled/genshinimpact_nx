@@ -2867,12 +2867,6 @@ static Result oc_backing_map_locked(void *destination, size_t size,
   if (R_SUCCEEDED(result) && source_out) *source_out = encoded;
   return result;
 }
-  __atomic_add_fetch(&oc_map_call_count, 1, __ATOMIC_RELAXED);
-  __atomic_store_n(&oc_last_map_result, (uint32_t)result,
-                   __ATOMIC_RELAXED);
-  if (R_SUCCEEDED(result) && source_out) *source_out = encoded;
-  return result;
-}
 
 /* One-shot diagnostic for the first code-alias unmap failure.  Write the
  * destination's and source's queried memory states plus every arena base
