@@ -245,6 +245,10 @@ typedef struct {
    * the writable alias stayed mapped for safe reuse. */
   uint64_t backing_unmap_ok;
   uint64_t backing_unmap_fail;
+  /* Failures where the caller keeps the source id recorded and the donor
+   * units owned so the exact unmap can be retried; releasing on failure
+   * could let a second alias onto still-live source pages. */
+  uint64_t backing_unmap_fail_retained;
 } NxSparseArenaDiagnostics;
 
 typedef enum {

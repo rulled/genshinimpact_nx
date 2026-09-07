@@ -2134,9 +2134,10 @@ static void log_crash_exit(const char *reason, void *caller_ra) {
               diag.dynamic_mapped_bytes / MiB,
               diag.peak_dynamic_mapped_bytes / MiB,
               diag.last_map_result);
-      fprintf(f, "backing_unmap ok=%llu fail=%llu\n",
+      fprintf(f, "backing_unmap ok=%llu fail=%llu retained=%llu\n",
               (unsigned long long)diag.backing_unmap_ok,
-              (unsigned long long)diag.backing_unmap_fail);
+              (unsigned long long)diag.backing_unmap_fail,
+              (unsigned long long)diag.backing_unmap_fail_retained);
       sbrk_extension_report(f);
       memory_broker_histogram_report(f);
       fflush(f);
@@ -2256,9 +2257,10 @@ void abort(void) {
               diag.dynamic_mapped_bytes / MiB,
               diag.peak_dynamic_mapped_bytes / MiB,
               diag.last_map_result);
-      fprintf(f, "backing_unmap ok=%llu fail=%llu\n",
+      fprintf(f, "backing_unmap ok=%llu fail=%llu retained=%llu\n",
               (unsigned long long)diag.backing_unmap_ok,
-              (unsigned long long)diag.backing_unmap_fail);
+              (unsigned long long)diag.backing_unmap_fail,
+              (unsigned long long)diag.backing_unmap_fail_retained);
     }
     sbrk_extension_report(f);
     memory_broker_histogram_report(f);

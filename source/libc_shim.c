@@ -2173,6 +2173,10 @@ static uint32_t oc_last_map_result;
  * state directly. */
 static uint64_t oc_backing_unmap_ok;
 static uint64_t oc_backing_unmap_fail;
+/* Failures where the caller keeps the source id recorded and the donor units
+ * owned so the exact unmap can be retried; releasing on failure could let a
+ * second alias onto still-live source pages. */
+static uint64_t oc_backing_unmap_fail_retained;
 static uint64_t oc_spill_pages;
 static uint64_t oc_peak_spill_pages;
 static uint64_t oc_host_spill_pages;
@@ -2866,6 +2870,87 @@ static void oc_backing_unmap_diag_once(void *destination, size_t size,
     (size_t)oc_dynamic_pages * MMAP_PAGE,
     g_heap_donor_base, g_heap_donor_capacity);
   if (n > 0) (void)write(2, buf, (size_t)(n < (int)sizeof buf ? n : (int)sizeof buf - 1));
+
+  /* Bounded walk of the whole destination range, one compact line per queried
+   * block, then a single classification line.  A live code alias covers its
+   * whole range with ModuleCodeMutable (map verifies that state), so any other
+   * block type names the mapping that took the VA over.  Capped at 64 blocks;
+   * every line goes straight to fd 2 with no allocation. */
+  {
+    const uintptr_t walk_begin = (uintptr_t)destination;
+    if (size <= UINTPTR_MAX - walk_begin) {
+      const uintptr_t walk_end = walk_begin + size;
+      MemoryInfo walk_info;
+      u32 walk_page_info = 0;
+      uintptr_t cursor = walk_begin;
+      size_t alias_bytes = 0;
+      size_t unmapped_bytes = 0;
+      size_t other_bytes = 0;
+      size_t blocks = 0;
+      int walk_failed = 0;
+      int walk_truncated = 0;
+      while (cursor < walk_end) {
+        if (blocks >= 64) {
+          walk_truncated = 1;
+          break;
+        }
+        if (R_FAILED(svcQueryMemory(&walk_info, &walk_page_info, cursor)) ||
+            walk_info.addr > cursor ||
+            walk_info.size > UINTPTR_MAX - (uintptr_t)walk_info.addr) {
+          walk_failed = 1;
+          break;
+        }
+        const uintptr_t span_end =
+          (uintptr_t)walk_info.addr + (uintptr_t)walk_info.size;
+        const uintptr_t block_end = span_end < walk_end ? span_end : walk_end;
+        const size_t span = block_end > cursor ? block_end - cursor : 0;
+        if (!span) {
+          walk_failed = 1;
+          break;
+        }
+        if (walk_info.type == MemType_ModuleCodeMutable)
+          alias_bytes += span;
+        else if (walk_info.type == MemType_Unmapped)
+          unmapped_bytes += span;
+        else
+          other_bytes += span;
+        char walk_buf[192];
+        const int wn = snprintf(walk_buf, sizeof walk_buf,
+          "backing_unmap_dst_walk[%zu] addr=0x%lx size=0x%lx type=%u "
+          "perm=0x%x attr=0x%x ip=0x%x\n",
+          blocks,
+          (unsigned long)walk_info.addr, (unsigned long)walk_info.size,
+          (unsigned)walk_info.type, (unsigned)walk_info.perm,
+          (unsigned)walk_info.attr, (unsigned)walk_page_info);
+        if (wn > 0)
+          (void)write(2, walk_buf,
+                      (size_t)(wn < (int)sizeof walk_buf
+                                 ? wn : (int)sizeof walk_buf - 1));
+        ++blocks;
+        cursor = block_end;
+      }
+      const char *verdict = "dst already free";
+      if (walk_failed)
+        verdict = "dst walk inconclusive (query failed)";
+      else if (walk_truncated)
+        verdict = "dst walk truncated (64-block cap)";
+      else if (other_bytes)
+        verdict = "dst reused by non-alias mapping (DeviceShared etc.)";
+      else if (alias_bytes && unmapped_bytes)
+        verdict = "dst partially unmapped";
+      else if (alias_bytes)
+        verdict = "dst alias intact (reject likely on source state)";
+      char sum_buf[160];
+      const int sn = snprintf(sum_buf, sizeof sum_buf,
+        "backing_unmap_dst_summary %s alias=0x%zx unmapped=0x%zx "
+        "other=0x%zx blocks=%zu\n",
+        verdict, alias_bytes, unmapped_bytes, other_bytes, blocks);
+      if (sn > 0)
+        (void)write(2, sum_buf,
+                    (size_t)(sn < (int)sizeof sum_buf
+                               ? sn : (int)sizeof sum_buf - 1));
+    }
+  }
 }
 
 static Result oc_backing_unmap_locked(void *destination, size_t size,
@@ -2884,6 +2969,7 @@ static Result oc_backing_unmap_locked(void *destination, size_t size,
       unmap_addr < (uintptr_t)oc_base ||
       unmap_addr >= (uintptr_t)oc_base + oc_alias_layout_bytes) {
     __atomic_add_fetch(&oc_backing_unmap_fail, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&oc_backing_unmap_fail_retained, 1, __ATOMIC_RELAXED);
     oc_backing_unmap_diag_once(destination, size, NULL,
       MAKERESULT(Module_Libnx, LibnxError_BadInput));
     return MAKERESULT(Module_Libnx, LibnxError_BadInput);
@@ -2904,6 +2990,7 @@ static Result oc_backing_unmap_locked(void *destination, size_t size,
     process, (u64)destination, (u64)source_address, size);
   if (R_FAILED(result)) {
     __atomic_add_fetch(&oc_backing_unmap_fail, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&oc_backing_unmap_fail_retained, 1, __ATOMIC_RELAXED);
     oc_backing_unmap_diag_once(destination, size, source_address, result);
     return result;
   }
@@ -3748,6 +3835,8 @@ void nx_sparse_arena_get_diagnostics(NxSparseArenaDiagnostics *out) {
     __atomic_load_n(&oc_backing_unmap_ok, __ATOMIC_RELAXED);
   out->backing_unmap_fail =
     __atomic_load_n(&oc_backing_unmap_fail, __ATOMIC_RELAXED);
+  out->backing_unmap_fail_retained =
+    __atomic_load_n(&oc_backing_unmap_fail_retained, __ATOMIC_RELAXED);
   out->ownership_record_capacity =
     __atomic_load_n(&oc_dynamic_pages, __ATOMIC_RELAXED) +
       oc_donor_unit_capacity;
