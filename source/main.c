@@ -2097,6 +2097,51 @@ static void log_crash_exit(const char *reason, void *caller_ra) {
             (unsigned long)g_il2cpp_base,
             (unsigned long)g_il2cpp_size);
 
+    /* Allocator state next, flushed immediately: fatal_error() reaches this
+     * file through exit()->log_crash_exit(), not abort(), so the allocator
+     * dump added to abort() never ran on the donor-exhaustion fatals (the
+     * 0x1f59 crash_exit.txt had no allocator lines).  Donor exhaustion vs
+     * dlmalloc residency here distinguishes a ceiling abort from a wrapper
+     * bug the same way abort()'s reorder does. */
+    {
+      NxSparseArenaDiagnostics diag = {0};
+      nx_sparse_arena_get_diagnostics(&diag);
+      const unsigned long long MiB = 1024ull * 1024ull;
+      fprintf(f,
+              "pool backend=%u committed=%lluMiB peak_committed=%lluMiB "
+              "pool_free=%lluMiB largest_free=%lluMiB\n",
+              diag.backing_backend,
+              diag.committed_bytes / MiB,
+              diag.peak_committed_bytes / MiB,
+              diag.pool_free_bytes / MiB,
+              diag.pool_largest_free_bytes / MiB);
+      fprintf(f,
+              "donor cap=%lluMiB active=%lluMiB used=%lluMiB/peak=%lluMiB "
+              "grow=%llu shrink=%llu last_resize=0x%x\n",
+              diag.donor_capacity_bytes / MiB,
+              diag.donor_active_bytes / MiB,
+              diag.donor_used_bytes / MiB,
+              diag.donor_peak_used_bytes / MiB,
+              (unsigned long long)diag.donor_grow_calls,
+              (unsigned long long)diag.donor_shrink_calls,
+              diag.donor_last_resize_result);
+      fprintf(f,
+              "alloc_failures guest=%llu host=%llu thread=%llu "
+              "dynamic_mapped=%lluMiB/peak=%lluMiB last_map=0x%x\n",
+              (unsigned long long)diag.guest_allocation_failures,
+              (unsigned long long)diag.host_allocation_failures,
+              (unsigned long long)diag.thread_allocation_failures,
+              diag.dynamic_mapped_bytes / MiB,
+              diag.peak_dynamic_mapped_bytes / MiB,
+              diag.last_map_result);
+      fprintf(f, "backing_unmap ok=%llu fail=%llu\n",
+              (unsigned long long)diag.backing_unmap_ok,
+              (unsigned long long)diag.backing_unmap_fail);
+      sbrk_extension_report(f);
+      memory_broker_histogram_report(f);
+      fflush(f);
+    }
+
     extern void _start(void);
     extern char __bss_end__[];
     const uintptr_t host_base = (uintptr_t)&_start;
