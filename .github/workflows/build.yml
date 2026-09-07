@@ -86,5 +86,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: genshinimpact_nx
-          path: genshinimpact_nx.nro
+          path: |
+            genshinimpact_nx.nro
+            genshinimpact_nx.elf
           if-no-files-found: error
