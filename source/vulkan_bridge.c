@@ -53,6 +53,9 @@ static int g_present_fail_count;
 static int g_acquire_count;
 static int g_acquire_fail_count;
 static int g_alloc_large_count;
+static int g_pipe_create_calls;
+static int g_pipe_throttled_calls;
+static int g_pipe_window_peak;
 
 #define NX_VK_MEMORY_RECORD_CAPACITY 512
 #define NX_VK_THROTTLE_PERIOD 256
@@ -110,6 +113,109 @@ static void records_lock(void) {
 
 static void records_unlock(void) {
   __atomic_clear(&g_memory_records_lock, __ATOMIC_RELEASE);
+}
+
+/* ---- login pipeline-creation throttle ---- */
+
+/* PrecompileShaders drives thousands of vkCreate{Graphics,Compute}Pipelines
+ * calls through the NVK compiler from the login worker threads; the compiler's
+ * transient open_memstream draw can exhaust the process heap donor before the
+ * allocator keeps pace.  Admission is capped at N calls per W ms window across
+ * every thread; waiters sleep outside the lock in short slices so a burst
+ * drains smoothly without stalling other bridge bookkeeping. */
+#define NX_VK_PIPE_DEFAULT_CALLS 5
+#define NX_VK_PIPE_WINDOW_MS 16
+#define NX_VK_PIPE_MAX_SLEEP_NS 4000000ULL
+
+static uint64_t g_pipe_window_ticks;
+static uint64_t g_pipe_window_start;
+static int g_pipe_window_arrivals;
+static int g_pipe_window_budget;
+static int g_pipe_calls_per_window = NX_VK_PIPE_DEFAULT_CALLS;
+static volatile unsigned char g_pipe_throttle_lock;
+static volatile unsigned char g_pipe_throttle_configured;
+
+static void pipe_throttle_lock(void) {
+  while (__atomic_test_and_set(&g_pipe_throttle_lock, __ATOMIC_ACQUIRE))
+    svcSleepThread(0);
+}
+
+static void pipe_throttle_unlock(void) {
+  __atomic_clear(&g_pipe_throttle_lock, __ATOMIC_RELEASE);
+}
+
+/* One-time configuration under the throttle lock; afterwards the hot path is
+ * a single acquire load.  GENSHIN_PIPE_THROTTLE="N,W" overrides the defaults
+ * (N=0 disables, W alone keeps the default window). */
+static int pipe_throttle_enabled(void) {
+  if (__atomic_load_n(&g_pipe_throttle_configured, __ATOMIC_ACQUIRE))
+    return g_pipe_calls_per_window > 0;
+  pipe_throttle_lock();
+  if (!g_pipe_throttle_configured) {
+    int calls = NX_VK_PIPE_DEFAULT_CALLS;
+    uint64_t window_ms = NX_VK_PIPE_WINDOW_MS;
+    const char *text = getenv("GENSHIN_PIPE_THROTTLE");
+    if (text && text[0]) {
+      char *end = NULL;
+      const long parsed_calls = strtol(text, &end, 10);
+      if (end != text && parsed_calls >= 0) {
+        if (*end == ',') {
+          long parsed_window = strtol(end + 1, &end, 10);
+          if (parsed_window > 0) {
+            /* Clamp so the ns conversion cannot wrap. */
+            if (parsed_window > 999999) parsed_window = 999999;
+            window_ms = (uint64_t)parsed_window;
+          }
+        }
+        calls = (int)parsed_calls;
+      }
+    }
+    g_pipe_calls_per_window = calls;
+    g_pipe_window_ticks = armNsToTicks(window_ms * 1000000ULL);
+    __atomic_store_n(&g_pipe_throttle_configured, 1, __ATOMIC_RELEASE);
+  }
+  pipe_throttle_unlock();
+  return g_pipe_calls_per_window > 0;
+}
+
+/* Block until the shared window has budget for one more creation call.  The
+ * sleep never runs with the throttle lock held. */
+static void pipe_throttle_admit(void) {
+  if (!pipe_throttle_enabled()) return;
+  const uint64_t window_ticks = g_pipe_window_ticks;
+  const uint64_t max_sleep_ticks = armNsToTicks(NX_VK_PIPE_MAX_SLEEP_NS);
+  __atomic_add_fetch(&g_pipe_create_calls, 1, __ATOMIC_SEQ_CST);
+  unsigned char first_attempt = 1;
+  int throttled = 0;
+  for (;;) {
+    uint64_t sleep_ticks = 0;
+    pipe_throttle_lock();
+    const uint64_t now = armGetSystemTick();
+    if (now - g_pipe_window_start >= window_ticks) {
+      if (g_pipe_window_arrivals > g_pipe_window_peak)
+        __atomic_store_n(&g_pipe_window_peak, g_pipe_window_arrivals,
+                         __ATOMIC_RELAXED);
+      g_pipe_window_start = now;
+      __atomic_store_n(&g_pipe_window_arrivals, 0, __ATOMIC_RELAXED);
+      g_pipe_window_budget = g_pipe_calls_per_window;
+    }
+    if (first_attempt) {
+      first_attempt = 0;
+      __atomic_add_fetch(&g_pipe_window_arrivals, 1, __ATOMIC_RELAXED);
+    }
+    if (g_pipe_window_budget > 0) {
+      --g_pipe_window_budget;
+      pipe_throttle_unlock();
+      if (throttled)
+        __atomic_add_fetch(&g_pipe_throttled_calls, 1, __ATOMIC_SEQ_CST);
+      return;
+    }
+    sleep_ticks = window_ticks - (now - g_pipe_window_start);
+    pipe_throttle_unlock();
+    throttled = 1;
+    if (sleep_ticks > max_sleep_ticks) sleep_ticks = max_sleep_ticks;
+    svcSleepThread(armTicksToNs(sleep_ticks));
+  }
 }
 
 static int env_enabled(const char *name, int *state) {
@@ -445,6 +551,32 @@ static VKAPI_ATTR VkResult VKAPI_CALL nx_vkBindImageMemory(
     }
   }
   return result;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL nx_vkCreateGraphicsPipelines(
+    VkDevice device, VkPipelineCache pipeline_cache, uint32_t create_info_count,
+    const VkGraphicsPipelineCreateInfo *create_infos,
+    const VkAllocationCallbacks *allocator, VkPipeline *pipelines) {
+  PFN_vkCreateGraphicsPipelines create_pipelines =
+    (PFN_vkCreateGraphicsPipelines)device_proc(device,
+                                               "vkCreateGraphicsPipelines");
+  if (!create_pipelines) return VK_ERROR_INITIALIZATION_FAILED;
+  pipe_throttle_admit();
+  return create_pipelines(device, pipeline_cache, create_info_count,
+                          create_infos, allocator, pipelines);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL nx_vkCreateComputePipelines(
+    VkDevice device, VkPipelineCache pipeline_cache, uint32_t create_info_count,
+    const VkComputePipelineCreateInfo *create_infos,
+    const VkAllocationCallbacks *allocator, VkPipeline *pipelines) {
+  PFN_vkCreateComputePipelines create_pipelines =
+    (PFN_vkCreateComputePipelines)device_proc(device,
+                                              "vkCreateComputePipelines");
+  if (!create_pipelines) return VK_ERROR_INITIALIZATION_FAILED;
+  pipe_throttle_admit();
+  return create_pipelines(device, pipeline_cache, create_info_count,
+                          create_infos, allocator, pipelines);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL nx_vkQueueSubmit(
@@ -906,6 +1038,17 @@ void nx_vk_report(FILE *file) {
     &g_swapchain_creations, __ATOMIC_RELAXED);
   const uint64_t swapchain_recreations = __atomic_load_n(
     &g_swapchain_recreations, __ATOMIC_RELAXED);
+  const int pipe_create_calls = __atomic_load_n(&g_pipe_create_calls,
+                                                __ATOMIC_RELAXED);
+  const int pipe_throttled_calls = __atomic_load_n(&g_pipe_throttled_calls,
+                                                   __ATOMIC_RELAXED);
+  const int pipe_window_peak = __atomic_load_n(&g_pipe_window_peak,
+                                               __ATOMIC_RELAXED);
+  const int pipe_window_live = __atomic_load_n(&g_pipe_window_arrivals,
+                                               __ATOMIC_RELAXED);
+  const uint64_t pipe_window_ms = g_pipe_window_ticks
+    ? armTicksToNs(g_pipe_window_ticks) / 1000000ULL
+    : (uint64_t)NX_VK_PIPE_WINDOW_MS;
   fprintf(file, "[VK] counters acquire=%d ok=%llu suboptimal=%llu "
           "out_of_date=%llu other=%llu fail=%d submit=%d ok=%llu fail=%d "
           "drains=%d present=%d ok=%llu suboptimal=%llu out_of_date=%llu "
@@ -942,6 +1085,12 @@ void nx_vk_report(FILE *file) {
           (unsigned long long)registry_overflows,
           (unsigned long long)swapchain_creations,
           (unsigned long long)swapchain_recreations);
+  fprintf(file, "[VK] pipe throttle calls=%d throttled=%d peak_window=%d "
+          "per_window=%d window_ms=%llu\n",
+          pipe_create_calls, pipe_throttled_calls,
+          pipe_window_live > pipe_window_peak ? pipe_window_live
+                                              : pipe_window_peak,
+          g_pipe_calls_per_window, (unsigned long long)pipe_window_ms);
   if (dcache_enabled && registry_overflows) {
     fprintf(file, "[E] VK dcache registry overflowed %llu times; Vulkan "
             "calls were preserved but those allocations were not tracked\n",
@@ -979,6 +1128,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL nx_vkGetDeviceProcAddr(
     return (PFN_vkVoidFunction)&nx_vkGetDeviceQueue;
   if (name && strcmp(name, "vkCreateSwapchainKHR") == 0)
     return (PFN_vkVoidFunction)&nx_vkCreateSwapchainKHR;
+  if (name && strcmp(name, "vkCreateGraphicsPipelines") == 0)
+    return (PFN_vkVoidFunction)&nx_vkCreateGraphicsPipelines;
+  if (name && strcmp(name, "vkCreateComputePipelines") == 0)
+    return (PFN_vkVoidFunction)&nx_vkCreateComputePipelines;
   return device_proc(device, name);
 }
 
@@ -1042,6 +1195,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL nx_vkGetInstanceProcAddr(
     return (PFN_vkVoidFunction)&nx_vkGetDeviceQueue;
   if (strcmp(name, "vkCreateSwapchainKHR") == 0)
     return (PFN_vkVoidFunction)&nx_vkCreateSwapchainKHR;
+  if (strcmp(name, "vkCreateGraphicsPipelines") == 0)
+    return (PFN_vkVoidFunction)&nx_vkCreateGraphicsPipelines;
+  if (strcmp(name, "vkCreateComputePipelines") == 0)
+    return (PFN_vkVoidFunction)&nx_vkCreateComputePipelines;
   return driver_proc(instance, name);
 }
 
@@ -1137,5 +1294,7 @@ void *nx_vk_lookup(const char *name) {
   if (strcmp(name, "vkAcquireNextImageKHR") == 0) return &nx_vkAcquireNextImageKHR;
   if (strcmp(name, "vkGetDeviceQueue") == 0) return &nx_vkGetDeviceQueue;
   if (strcmp(name, "vkCreateSwapchainKHR") == 0) return &nx_vkCreateSwapchainKHR;
+  if (strcmp(name, "vkCreateGraphicsPipelines") == 0) return &nx_vkCreateGraphicsPipelines;
+  if (strcmp(name, "vkCreateComputePipelines") == 0) return &nx_vkCreateComputePipelines;
   return (void *)driver_proc(VK_NULL_HANDLE, name);
 }
