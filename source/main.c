@@ -1051,15 +1051,24 @@ static void *sparse_stack_self_test_thread(void *opaque) {
 }
 
 static const char *g_sparse_guest_test_failure = "not run";
+static size_t g_sparse_guest_test_request;
+static size_t g_sparse_guest_test_usable;
+static NxSparseArenaDiagnostics g_sparse_guest_test_diag;
+static int g_sparse_guest_test_diag_valid;
 
 static int sparse_guest_spill_self_test_failed(
     const char *stage, void *allocation, size_t requested, size_t usable,
     const NxSparseArenaDiagnostics *before) {
   (void)allocation;
-  (void)requested;
-  (void)usable;
-  (void)before;
   g_sparse_guest_test_failure = stage;
+  g_sparse_guest_test_request = requested;
+  g_sparse_guest_test_usable = usable;
+  if (before) {
+    g_sparse_guest_test_diag = *before;
+    g_sparse_guest_test_diag_valid = 1;
+  } else {
+    g_sparse_guest_test_diag_valid = 0;
+  }
   return 0;
 }
 
@@ -2399,9 +2408,55 @@ int main(int argc, char **argv) {
     fatal_error("Android pthread storage initialization self-test failed.");
 
   initialize_sparse_arena();
-  if (!sparse_guest_spill_self_test())
-    fatal_error("Dynamic guest allocation lifecycle self-test failed at %s.",
-                g_sparse_guest_test_failure);
+  if (!sparse_guest_spill_self_test()) {
+    /* Dump the sparse-arena counters captured at the failure point so a
+     * foreign environment (emulator, unusual memory arrangement) can be
+     * diagnosed without reproducing it under a debugger. */
+    extern const char *g_oc_pool_last_failure_stage;
+    FILE *df = fopen(DATA_ROOT "/arena_debug.txt", "w");
+    if (df) {
+      fprintf(df, "failure_stage=sparse-guest:%s pool_stage=%s\n",
+              g_sparse_guest_test_failure, g_oc_pool_last_failure_stage);
+      if (g_sparse_guest_test_diag_valid) {
+        const NxSparseArenaDiagnostics *d = &g_sparse_guest_test_diag;
+        fprintf(df,
+                "backend=%d request=0x%zx usable=0x%zx\n",
+                (int)d->backing_backend, g_sparse_guest_test_request,
+                g_sparse_guest_test_usable);
+        fprintf(df,
+                "virtual=0x%zx pool=0x%zx reserved=0x%zx committed=0x%zx "
+                "spill=0x%zx\n",
+                d->virtual_capacity_bytes, d->pool_capacity_bytes,
+                d->reserved_bytes, d->committed_bytes, d->spill_bytes);
+        fprintf(df,
+                "dynamic_mapped=0x%zx donor_capacity=0x%zx "
+                "donor_active=0x%zx donor_used=0x%zx\n",
+                d->dynamic_mapped_bytes, d->donor_capacity_bytes,
+                d->donor_active_bytes, d->donor_used_bytes);
+        fprintf(df,
+                "donor_grow=%llu donor_shrink=%llu donor_resize_result=0x%x "
+                "guest_fails=%llu last_map_result=0x%x "
+                "map_calls=%llu map_retries=%llu\n",
+                (unsigned long long)d->donor_grow_calls,
+                (unsigned long long)d->donor_shrink_calls,
+                d->donor_last_resize_result,
+                (unsigned long long)d->guest_allocation_failures,
+                d->last_map_result,
+                (unsigned long long)d->map_call_count,
+                (unsigned long long)d->map_retry_count);
+        fprintf(df,
+                "records=%llu/%llu system_total=%llu system_used=%llu\n",
+                (unsigned long long)d->ownership_records_in_use,
+                (unsigned long long)d->ownership_record_capacity,
+                (unsigned long long)d->system_total_memory_bytes,
+                (unsigned long long)d->system_used_memory_bytes);
+      }
+      fclose(df);
+    }
+    fatal_error("Dynamic guest allocation lifecycle self-test failed at %s "
+                "(pool stage %s, see arena_debug.txt).",
+                g_sparse_guest_test_failure, g_oc_pool_last_failure_stage);
+  }
   if (!sparse_alias_mmap_self_test())
     fatal_error("Sparse alias mmap lifecycle self-test failed at %s.",
                 g_sparse_mmap_test_failure);

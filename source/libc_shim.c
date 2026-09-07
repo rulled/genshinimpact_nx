@@ -3245,10 +3245,17 @@ static void oc_dynamic_return_extent_locked(size_t first, size_t pages) {
   }
 }
 
+/* Stage tag of the most recent oc_pool_owned_alloc failure branch.  The
+ * boot-time self-tests print it next to their fatal message so a failing
+ * environment (emulator, odd memory arrangement) can be diagnosed from the
+ * captured stderr alone. */
+const char *g_oc_pool_last_failure_stage = "none";
+
 static void *oc_pool_owned_alloc(size_t size, size_t alignment,
                                  OcPoolOwner owner) {
   if (!size || !alignment || (alignment & (alignment - 1u)) ||
       size > SIZE_MAX - (MMAP_PAGE - 1u)) {
+    g_oc_pool_last_failure_stage = "args";
     oc_pool_record_failure(owner);
     return NULL;
   }
@@ -3261,6 +3268,7 @@ static void *oc_pool_owned_alloc(size_t size, size_t alignment,
       g_memory_backing_backend == NX_MEMORY_BACKEND_HEAP_ALIAS) {
     if (size > SIZE_MAX - (OC_HEAP_DONOR_UNIT_BYTES - 1u) ||
         mutexIsLockedByCurrentThread(&g_mmap_lock)) {
+      g_oc_pool_last_failure_stage = "thread-donor-args";
       oc_pool_record_failure(owner);
       return NULL;
     }
@@ -3268,6 +3276,7 @@ static void *oc_pool_owned_alloc(size_t size, size_t alignment,
       (size + OC_HEAP_DONOR_UNIT_BYTES - 1u) /
         OC_HEAP_DONOR_UNIT_BYTES;
     if (!units || units > UINT32_MAX) {
+      g_oc_pool_last_failure_stage = "thread-donor-units";
       oc_pool_record_failure(owner);
       return NULL;
     }
@@ -3283,6 +3292,7 @@ static void *oc_pool_owned_alloc(size_t size, size_t alignment,
           units * OC_HEAP_DONOR_UNIT_BYTES, Perm_Rw, MemType_Heap)) {
       if (source) oc_donor_release_locked(source, units);
       mmap_broker_unlock();
+      g_oc_pool_last_failure_stage = "thread-donor-map";
       oc_pool_record_failure(owner);
       return NULL;
     }
@@ -3290,6 +3300,7 @@ static void *oc_pool_owned_alloc(size_t size, size_t alignment,
       oc_allocation_record_conflict_locked();
       oc_donor_release_locked(source, units);
       mmap_broker_unlock();
+      g_oc_pool_last_failure_stage = "thread-donor-record";
       oc_pool_record_failure(owner);
       return NULL;
     }
@@ -3308,6 +3319,7 @@ static void *oc_pool_owned_alloc(size_t size, size_t alignment,
   const size_t pages = (size + MMAP_PAGE - 1u) / MMAP_PAGE;
   if (!pages || pages > oc_dynamic_pages ||
       mutexIsLockedByCurrentThread(&g_mmap_lock)) {
+    g_oc_pool_last_failure_stage = "pages-range";
     oc_pool_record_failure(owner);
     return NULL;
   }
@@ -3318,6 +3330,7 @@ static void *oc_pool_owned_alloc(size_t size, size_t alignment,
     oc_dynamic_find_extent_locked(pages, alignment, &first);
   if (!extent) {
     mmap_broker_unlock();
+    g_oc_pool_last_failure_stage = "no-extent";
     oc_pool_record_failure(owner);
     return NULL;
   }
@@ -3325,11 +3338,13 @@ static void *oc_pool_owned_alloc(size_t size, size_t alignment,
   if (record->pages) {
     oc_allocation_record_conflict_locked();
     mmap_broker_unlock();
+    g_oc_pool_last_failure_stage = "record-conflict";
     oc_pool_record_failure(owner);
     return NULL;
   }
   if (!oc_dynamic_commit_segments_locked(first, pages)) {
     mmap_broker_unlock();
+    g_oc_pool_last_failure_stage = "commit-segments";
     oc_pool_record_failure(owner);
     return NULL;
   }
@@ -3339,6 +3354,7 @@ static void *oc_pool_owned_alloc(size_t size, size_t alignment,
      * cannot represent the aligned split. */
     oc_dynamic_release_segments_locked(first, pages);
     mmap_broker_unlock();
+    g_oc_pool_last_failure_stage = "consume-extent";
     oc_pool_record_failure(owner);
     return NULL;
   }
