@@ -2785,7 +2785,7 @@ static Result oc_backing_map_locked(void *destination, size_t size,
     encoded = oc_donor_allocate_locked(
       units, donor_alignment_units, donor_high);
     uint8_t *source = oc_donor_source_from_encoded(encoded);
-    const Handle process = envGetOwnProcessHandle();
+    const Handle process = nx_own_process_handle();
     if (source && process != INVALID_HANDLE &&
         oc_address_range_state(source, size, Perm_Rw, MemType_Heap)) {
       result = svcMapProcessCodeMemory(
@@ -2977,7 +2977,7 @@ static Result oc_backing_unmap_locked(void *destination, size_t size,
   uint8_t *source_address = oc_donor_source_from_encoded(source);
   if (!source_address)
     return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-  const Handle process = envGetOwnProcessHandle();
+  const Handle process = nx_own_process_handle();
   if (process == INVALID_HANDLE)
     return MAKERESULT(Module_Libnx, LibnxError_BadInput);
   /* svcSetProcessMemoryPermission(Perm_Rw) changes AliasCode into the writable

@@ -414,7 +414,9 @@ static void check_syscalls(void) {
   if (!envIsSyscallHinted(0x78)) fatal_error("svcUnmapProcessCodeMemory is unavailable.");
   if (!envIsSyscallHinted(0x73)) fatal_error("svcSetProcessMemoryPermission is unavailable.");
   if (envGetOwnProcessHandle() == INVALID_HANDLE)
-    fatal_error("Own process handle is unavailable. Launch through title override.");
+    fprintf(stderr,
+            "[W] own process handle unavailable (direct NRO launch); "
+            "falling back to CUR_PROCESS pseudo-handle\n");
 }
 
 static int bootstrap_memory_range_state(const void *address, size_t length,
