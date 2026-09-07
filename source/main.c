@@ -1318,7 +1318,37 @@ static int module_contains(const void *p, size_t bytes) {
   const uintptr_t begin = (uintptr_t)game_mod.load_virtbase;
   const uintptr_t end = begin + game_mod.load_size;
   const uintptr_t at = (uintptr_t)p;
-  return at >= begin && at <= end && bytes <= end - at;
+  if (at >= begin && at <= end && bytes <= end - at)
+    return 1;
+  if (!game_mod.finalized) {
+    /* Pre-finalize the module source copy in the heap backs the still
+     * reserved load_virtbase: accept source-space pointers as well. */
+    const uintptr_t sbegin = (uintptr_t)game_mod.load_base;
+    const uintptr_t send = sbegin + game_mod.load_size;
+    return at >= sbegin && at <= send && bytes <= send - at;
+  }
+  return 0;
+}
+
+/* Address of the guest code at rva.  Until so_finalize() donates the source
+ * pages, load_virtbase is only a reservation (reading it data-aborts), so
+ * hand out the writable heap source copy instead; afterwards the executable
+ * alias is the only live mapping. */
+static void *module_code_ptr(uintptr_t rva) {
+  if (!game_mod.finalized)
+    return (uint8_t *)game_mod.load_base + rva;
+  return (uint8_t *)game_mod.load_virtbase + rva;
+}
+
+/* Install code bytes at a module_code_ptr() target.  Pre-finalize the target
+ * is the plain heap source copy and a memcpy suffices; post-finalize the RX
+ * alias needs the writable-alias dance in so_patch_code(). */
+static int patch_module_code(void *target, const void *bytes, size_t len) {
+  if (!game_mod.finalized) {
+    memcpy(target, bytes, len);
+    return 0;
+  }
+  return so_patch_code(target, bytes, len);
 }
 
 static int module_contains_string(const char *p) {
@@ -1341,16 +1371,13 @@ static int module_contains_string(const char *p) {
  * m_jobject loads to m_jclass loads.  Every original instruction is checked
  * before any RX write, so another client version cannot be modified. */
 static void patch_unity_java_class_resolution(void) {
-  uint32_t *const replace_chars = (uint32_t *)(
-    (uintptr_t)game_mod.load_virtbase +
+  uint32_t *const replace_chars = (uint32_t *)module_code_ptr(
     GENSHIN_JAVA_CLASS_REPLACE_CHARS_RVA);
-  uint32_t *const generic_call = (uint32_t *)(
-    (uintptr_t)game_mod.load_virtbase + GENSHIN_JAVA_CLASS_GENERIC_CALL_RVA);
-  uint32_t *const object_consumer = (uint32_t *)(
-    (uintptr_t)game_mod.load_virtbase +
+  uint32_t *const generic_call = (uint32_t *)module_code_ptr(
+    GENSHIN_JAVA_CLASS_GENERIC_CALL_RVA);
+  uint32_t *const object_consumer = (uint32_t *)module_code_ptr(
     GENSHIN_JAVA_CLASS_OBJECT_CONSUMER_RVA);
-  uint32_t *const class_consumer = (uint32_t *)(
-    (uintptr_t)game_mod.load_virtbase +
+  uint32_t *const class_consumer = (uint32_t *)module_code_ptr(
     GENSHIN_JAVA_CLASS_CLASS_CONSUMER_RVA);
   static const uint32_t expected_replace[] = {
     UINT32_C(0x528005e1), /* mov w1, #0x2f */
@@ -1419,13 +1446,15 @@ static void patch_unity_java_class_resolution(void) {
     fatal_error("Unity Java class resolver instructions do not match the exact supported client (replace=%d generic=%d consumer=%d).",
                 pre_replace_ok, pre_generic_ok, pre_consumer_ok);
   const int rc_replace =
-    so_patch_code(replace_chars, patched_replace, sizeof(patched_replace));
+    patch_module_code(replace_chars, patched_replace, sizeof(patched_replace));
   const int rc_generic =
-    so_patch_code(generic_call, patched_generic, sizeof(patched_generic));
+    patch_module_code(generic_call, patched_generic, sizeof(patched_generic));
   const int rc_object =
-    so_patch_code(object_consumer, &patched_consumer, sizeof(patched_consumer));
+    patch_module_code(object_consumer, &patched_consumer,
+                      sizeof(patched_consumer));
   const int rc_class =
-    so_patch_code(class_consumer, &patched_consumer, sizeof(patched_consumer));
+    patch_module_code(class_consumer, &patched_consumer,
+                      sizeof(patched_consumer));
   const int post_replace_ok =
     !memcmp(replace_chars, patched_replace, sizeof(patched_replace));
   const int post_generic_ok =
@@ -1450,8 +1479,7 @@ uintptr_t genshin_unity_slab_activate_continue;
 extern void genshin_unity_slab_activate_dispatch(void);
 
 static void patch_unity_slab_activation(void) {
-  uint32_t *const sequence = (uint32_t *)(
-    (uintptr_t)game_mod.load_virtbase +
+  uint32_t *const sequence = (uint32_t *)module_code_ptr(
     GENSHIN_UNITY_SLAB_ACTIVATE_SEQUENCE_RVA);
   static const uint32_t expected[] = {
     UINT32_C(0xb0085988), /* adrp x8, aligned slab global */
@@ -1479,7 +1507,7 @@ static void patch_unity_slab_activation(void) {
   genshin_unity_slab_activate_continue =
     (uintptr_t)game_mod.load_virtbase +
     GENSHIN_UNITY_SLAB_ACTIVATE_CONTINUE_RVA;
-  if (so_patch_code(sequence, &replacement, sizeof(replacement)) ||
+  if (patch_module_code(sequence, &replacement, sizeof(replacement)) ||
       memcmp(sequence, &replacement, sizeof(replacement)))
     fatal_error("Could not install the Unity slab on-demand commit bridge.");
 }
@@ -1578,8 +1606,7 @@ void *genshin_mmoron_directory_sequence_bridge(void *parameters) {
 extern void genshin_mmoron_directory_sequence_dispatch(void);
 
 static void patch_mmoron_managed_directory_path(void) {
-  uint32_t *const sequence = (uint32_t *)(
-    (uintptr_t)game_mod.load_virtbase +
+  uint32_t *const sequence = (uint32_t *)module_code_ptr(
     GENSHIN_MMORON_DIRECTORY_SEQUENCE_RVA);
   static const uint32_t expected[] = {
     UINT32_C(0x94b69c55), /* bl Unity application-path getter thunk */
@@ -1605,7 +1632,7 @@ static void patch_mmoron_managed_directory_path(void) {
   genshin_mmoron_directory_continue =
     (uintptr_t)game_mod.load_virtbase +
     GENSHIN_MMORON_DIRECTORY_CONTINUE_RVA;
-  if (so_patch_code(sequence, &replacement, sizeof(replacement)) ||
+  if (patch_module_code(sequence, &replacement, sizeof(replacement)) ||
       memcmp(sequence, &replacement, sizeof(replacement)))
     fatal_error("Could not install the exact Mmoron managed-path normalizer.");
 }
@@ -1786,8 +1813,8 @@ static void genshin_transfer_int32_guard(const void *descriptor_, void *context_
 }
 
 static void patch_genshin_transfer_int32_guard(void) {
-  uint32_t *const callback = (uint32_t *)(
-    (uintptr_t)game_mod.load_virtbase + GENSHIN_TRANSFER_INT32_RVA);
+  uint32_t *const callback = (uint32_t *)module_code_ptr(
+    GENSHIN_TRANSFER_INT32_RVA);
   static const uint32_t expected[] = {
     UINT32_C(0xaa0003e8), /* mov x8, x0 */
     UINT32_C(0xf9401420), /* ldr x0, [x1, #40] */
@@ -1808,7 +1835,7 @@ static void patch_genshin_transfer_int32_guard(void) {
   if (!module_contains(callback, sizeof(expected)) ||
       memcmp(callback, expected, sizeof(expected)))
     fatal_error("SerializedFile int32 transfer callback does not match the exact supported client.");
-  if (so_patch_code(callback, &replacement, sizeof(replacement)) ||
+  if (patch_module_code(callback, &replacement, sizeof(replacement)) ||
       memcmp(callback, &replacement, sizeof(replacement)))
     fatal_error("Could not install the exact SerializedFile int32 transfer guard.");
 }
@@ -2604,13 +2631,16 @@ int main(int argc, char **argv) {
                 why ? ": " : "", why ? why : "");
   }
   startup_status_update("Finalizing Android relocations");
-  so_finalize(&game_mod);
-  so_flush_caches(&game_mod);
-
+  /* Install the exact-code patches while the module source copy is still a
+   * plain writable heap range: so_finalize() donates the already patched
+   * pages through the executable alias, which removes every
+   * svcSetProcessMemoryPermission dependency from the patch path. */
   patch_unity_java_class_resolution();
   patch_genshin_transfer_int32_guard();
   patch_mmoron_managed_directory_path();
   patch_unity_slab_activation();
+  so_finalize(&game_mod);
+  so_flush_caches(&game_mod);
 
   const uintptr_t host_thread_pointer = read_thread_pointer();
   static uint8_t main_bionic_tls[BIONIC_TLS_SIZE] __attribute__((aligned(16)));
