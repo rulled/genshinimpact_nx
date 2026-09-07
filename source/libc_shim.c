@@ -2770,6 +2770,44 @@ static void oc_donor_release_locked(uint32_t encoded, size_t units) {
   oc_donor_try_shrink_locked();
 }
 
+/* One-shot diagnostic for the first backing-map failure, written straight to
+ * fd 2 without allocating (the broker lock is held).  sub names the exact
+ * failed step and the queried source/destination states separate an emulator
+ * or unusual memory arrangement from a genuine kernel refusal. */
+static void oc_backing_map_diag_once(const char *sub, Result result,
+                                     void *destination, size_t size,
+                                     const void *source_address,
+                                     uint32_t encoded) {
+  static _Atomic int once = 0;
+  if (__atomic_exchange_n(&once, 1, __ATOMIC_ACQ_REL)) return;
+  MemoryInfo dst_info;
+  u32 dst_page_info = 0;
+  Result q = svcQueryMemory(&dst_info, &dst_page_info, (u64)destination);
+  MemoryInfo src_info;
+  u32 src_page_info = 0;
+  memset(&src_info, 0, sizeof(src_info));
+  Result sq = MAKERESULT(Module_Libnx, LibnxError_BadInput);
+  if (source_address)
+    sq = svcQueryMemory(&src_info, &src_page_info, (u64)source_address);
+  char buf[512];
+  int n = snprintf(buf, sizeof buf,
+    "backing_map_fail sub=%s result=0x%08x dst=%p size=0x%zx "
+    "encoded=%u src=%p query=0x%08x "
+    "dst[addr=0x%lx size=0x%lx type=%u perm=0x%x attr=0x%x] "
+    "srcq=0x%08x src[addr=0x%lx size=0x%lx type=%u perm=0x%x attr=0x%x]\n",
+    sub, (unsigned)result, destination, size,
+    (unsigned)encoded, source_address, (unsigned)q,
+    (unsigned long)dst_info.addr, (unsigned long)dst_info.size,
+    (unsigned)dst_info.type, (unsigned)dst_info.perm,
+    (unsigned)dst_info.attr,
+    (unsigned)sq,
+    (unsigned long)src_info.addr, (unsigned long)src_info.size,
+    (unsigned)src_info.type, (unsigned)src_info.perm,
+    (unsigned)src_info.attr);
+  if (n > 0)
+    (void)write(2, buf, (size_t)(n < (int)sizeof buf ? n : (int)sizeof buf - 1));
+}
+
 static Result oc_backing_map_locked(void *destination, size_t size,
                                     size_t donor_alignment_units,
                                     int donor_high,
@@ -2777,22 +2815,29 @@ static Result oc_backing_map_locked(void *destination, size_t size,
   if (source_out) *source_out = 0;
   Result result = MAKERESULT(Module_Libnx, LibnxError_HeapAllocFailed);
   uint32_t encoded = 0;
+  const void *diag_source = NULL;
+  const char *sub = "heap-alias-misaligned";
   if (g_memory_backing_backend == NX_MEMORY_BACKEND_PHYSICAL) {
+    sub = "svc-physical";
     result = svcMapPhysicalMemory(destination, size);
   } else if (g_memory_backing_backend == NX_MEMORY_BACKEND_HEAP_ALIAS &&
              size % OC_HEAP_DONOR_UNIT_BYTES == 0) {
     const size_t units = size / OC_HEAP_DONOR_UNIT_BYTES;
+    sub = "donor-alloc";
     encoded = oc_donor_allocate_locked(
       units, donor_alignment_units, donor_high);
     uint8_t *source = oc_donor_source_from_encoded(encoded);
+    diag_source = source;
     const Handle process = nx_own_process_handle();
     if (source && process != INVALID_HANDLE &&
         oc_address_range_state(source, size, Perm_Rw, MemType_Heap)) {
+      sub = "svc-map";
       result = svcMapProcessCodeMemory(
         process, (u64)destination, (u64)source, size);
       if (R_SUCCEEDED(result)) {
         const Result permission = svcSetProcessMemoryPermission(
           process, (u64)destination, size, Perm_Rw);
+        sub = R_FAILED(permission) ? "svc-perm" : "dst-state";
         if (R_FAILED(permission) ||
             !oc_address_range_state(destination, size, Perm_Rw,
                                     MemType_ModuleCodeMutable)) {
@@ -2807,10 +2852,21 @@ static Result oc_backing_map_locked(void *destination, size_t size,
             : MAKERESULT(Module_Libnx, LibnxError_BadQueryMemory);
         }
       }
+    } else if (R_FAILED(result)) {
+      sub = encoded ? "source-state" : "donor-alloc-exhausted";
     }
     if (R_FAILED(result) && encoded)
       oc_donor_release_locked(encoded, units);
   }
+  if (R_FAILED(result))
+    oc_backing_map_diag_once(sub, result, destination, size,
+                             diag_source, encoded);
+  __atomic_add_fetch(&oc_map_call_count, 1, __ATOMIC_RELAXED);
+  __atomic_store_n(&oc_last_map_result, (uint32_t)result,
+                   __ATOMIC_RELAXED);
+  if (R_SUCCEEDED(result) && source_out) *source_out = encoded;
+  return result;
+}
   __atomic_add_fetch(&oc_map_call_count, 1, __ATOMIC_RELAXED);
   __atomic_store_n(&oc_last_map_result, (uint32_t)result,
                    __ATOMIC_RELAXED);

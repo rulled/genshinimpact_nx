@@ -2451,6 +2451,27 @@ int main(int argc, char **argv) {
                 (unsigned long long)d->system_total_memory_bytes,
                 (unsigned long long)d->system_used_memory_bytes);
       }
+      /* Counters as of right now (post-failure) carry the actual svc result
+       * codes of the failed attempt; the stashed block above is the pre-call
+       * snapshot. */
+      NxSparseArenaDiagnostics now;
+      nx_sparse_arena_get_diagnostics(&now);
+      fprintf(df,
+              "NOW pool_stage=%s map_calls=%llu map_retries=%llu "
+              "last_map_result=0x%x\n",
+              g_oc_pool_last_failure_stage,
+              (unsigned long long)now.map_call_count,
+              (unsigned long long)now.map_retry_count,
+              now.last_map_result);
+      fprintf(df,
+              "NOW dynamic_mapped=0x%zx donor_used=0x%zx donor_grow=%llu "
+              "donor_shrink=%llu donor_resize_result=0x%x "
+              "guest_fails=%llu\n",
+              now.dynamic_mapped_bytes, now.donor_used_bytes,
+              (unsigned long long)now.donor_grow_calls,
+              (unsigned long long)now.donor_shrink_calls,
+              now.donor_last_resize_result,
+              (unsigned long long)now.guest_allocation_failures);
       fclose(df);
     }
     fatal_error("Dynamic guest allocation lifecycle self-test failed at %s "
