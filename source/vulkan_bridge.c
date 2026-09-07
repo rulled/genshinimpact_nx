@@ -331,7 +331,11 @@ static void forget_memory(VkDevice device, VkDeviceMemory memory) {
 #define NX_VK_PIPELINE_CACHE_MAGIC    0x4e585043u /* 'NXPC' */
 #define NX_VK_PIPELINE_CACHE_VERSION  1u
 #define NX_VK_PIPELINE_CACHE_MAX_DUMP (64u * 1024u * 1024u)
-#define NX_VK_PIPELINE_CACHE_CAPACITY 8
+/* The game creates 34 device-level caches per boot (registry overflow at the
+ * old cap of 8), so track every one of them: the device-destroy path merges
+ * all live caches into the persisted blob, and a missed cache is warmup work
+ * redone — and re-allocated — on every boot. */
+#define NX_VK_PIPELINE_CACHE_CAPACITY 64
 
 typedef struct {
   uint32_t magic;
@@ -387,8 +391,10 @@ static int pipeline_cache_driver_identity(uint32_t *driver_version,
 }
 
 /* Read the blob persisted by a previous boot.  Returns NULL (after deleting
- * the file) whenever the header or contents cannot be trusted. */
-static void *pipeline_cache_load(size_t *blob_size) {
+ * the file) whenever the header or contents cannot be trusted.  The creation
+ * path announces the injection; the persistence path reuses the same loader
+ * quietly to seed its merge accumulator. */
+static void *pipeline_cache_load(size_t *blob_size, int announce) {
   *blob_size = 0;
   FILE *file = fopen(NX_VK_PIPELINE_CACHE_PATH, "rb");
   if (!file) return NULL;
@@ -407,8 +413,9 @@ static void *pipeline_cache_load(size_t *blob_size) {
     blob = malloc(header.blob_size);
     if (blob && fread(blob, 1, header.blob_size, file) == header.blob_size) {
       *blob_size = header.blob_size;
-      log_line("[VK] pipeline cache initial data %u bytes\n",
-               (unsigned)header.blob_size);
+      if (announce)
+        log_line("[VK] pipeline cache initial data %u bytes\n",
+                 (unsigned)header.blob_size);
     } else {
       free(blob);
       blob = NULL;
@@ -477,11 +484,57 @@ static void pipeline_cache_dump_locked(VkDevice device,
     unlink(NX_VK_PIPELINE_CACHE_TMP_PATH);
 }
 
-/* Serialized: two caches dying concurrently must not interleave the tmp-file
- * writes, and this also keeps the dump off the registry lock's fast path. */
-static void pipeline_cache_dump(VkDevice device, VkPipelineCache cache) {
+/* Persist the union of the given live caches.  NVK serializes each cache
+ * independently and the single-slot file only ever held whichever cache died
+ * last, so on the next boot NAK recompiled everything else from scratch —
+ * the recurring donor-exhaustion crash at 3% shader warmup.  A driver-side
+ * merge into a fresh accumulator (seeded with the previously persisted blob,
+ * itself re-injected into every cache at creation) is the only way to keep
+ * all caches' pipelines across boots.  On any merge failure fall back to the
+ * old last-writer-wins dump so persistence never regresses below its old
+ * behavior.  Serialized by the same lock: concurrent deaths must not
+ * interleave tmp-file writes. */
+static void pipeline_cache_persist(VkDevice device,
+                                   const VkPipelineCache *sources,
+                                   size_t source_count) {
+  if (!sources || !source_count) return;
   pipeline_cache_lock();
-  pipeline_cache_dump_locked(device, cache);
+  PFN_vkCreatePipelineCache create_cache =
+    (PFN_vkCreatePipelineCache)device_proc(device,
+                                           "vkCreatePipelineCache");
+  PFN_vkMergePipelineCaches merge_caches =
+    (PFN_vkMergePipelineCaches)device_proc(device,
+                                           "vkMergePipelineCaches");
+  PFN_vkDestroyPipelineCache destroy_cache =
+    (PFN_vkDestroyPipelineCache)device_proc(device,
+                                            "vkDestroyPipelineCache");
+  int merged = 0;
+  if (create_cache && merge_caches && destroy_cache) {
+    size_t seed_size = 0;
+    void *seed = pipeline_cache_load(&seed_size, 0);
+    const VkPipelineCacheCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+      .pInitialData = seed,
+      .initialDataSize = seed_size,
+    };
+    VkPipelineCache accumulator = VK_NULL_HANDLE;
+    if (create_cache(device, &info, NULL, &accumulator) == VK_SUCCESS &&
+        accumulator != VK_NULL_HANDLE) {
+      merged = merge_caches(device, accumulator, (uint32_t)source_count,
+                            sources) == VK_SUCCESS;
+      if (merged)
+        pipeline_cache_dump_locked(device, accumulator);
+      destroy_cache(device, accumulator, NULL);
+    }
+    free(seed);
+  }
+  if (!merged) {
+    for (size_t i = 0; i < source_count; ++i)
+      pipeline_cache_dump_locked(device, sources[i]);
+  } else {
+    log_line("[VK] pipeline cache merged %u sources\n",
+             (unsigned)source_count);
+  }
   pipeline_cache_unlock();
 }
 
@@ -514,7 +567,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL nx_vkCreatePipelineCache(
   if (!create_info || !cache || create_info->initialDataSize)
     return create_cache(device, create_info, allocator, cache);
   size_t blob_size = 0;
-  void *blob = pipeline_cache_load(&blob_size);
+  void *blob = pipeline_cache_load(&blob_size, 1);
   const VkPipelineCacheCreateInfo *passed = create_info;
   VkPipelineCacheCreateInfo local;
   if (blob) {
@@ -550,7 +603,7 @@ static VKAPI_ATTR void VKAPI_CALL nx_vkDestroyPipelineCache(
              sizeof g_pipeline_cache_records[i]);
     }
     pipeline_cache_unlock();
-    pipeline_cache_dump(device, cache);
+    pipeline_cache_persist(device, &cache, 1);
   }
   if (destroy_cache) destroy_cache(device, cache, allocator);
 }
@@ -575,8 +628,7 @@ static VKAPI_ATTR void VKAPI_CALL nx_vkDestroyDevice(
            sizeof g_pipeline_cache_records[i]);
   }
   pipeline_cache_unlock();
-  for (size_t i = 0; i < count; ++i)
-    pipeline_cache_dump(device, caches[i]);
+  pipeline_cache_persist(device, caches, count);
   if (destroy_device) destroy_device(device, allocator);
 }
 
