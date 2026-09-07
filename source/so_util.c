@@ -994,6 +994,25 @@ int so_dl_iterate_phdr(int (*callback)(void *info, size_t size, void *data), voi
   return ret;
 }
 
+/* Fallback when the writable alias cannot be established: flip the target
+ * pages writable, copy, and restore execute permission.  Only used on
+ * environments that refuse svcMapProcessMemory into ASLR space; the alias
+ * path stays first because it leaves the page permissions untouched. */
+static int so_patch_code_direct(void *dst, const void *src, size_t len) {
+  uintptr_t start = (uintptr_t)dst & ~0xFFFull;
+  size_t maplen = ((((uintptr_t)dst + len) - start) + 0xFFF) & ~0xFFFull;
+  Result rc = svcSetProcessMemoryPermission(
+    nx_own_process_handle(), (u64)start, maplen, Perm_Rw);
+  if (R_FAILED(rc)) return -3;
+  memcpy(dst, src, len);
+  rc = svcSetProcessMemoryPermission(
+    nx_own_process_handle(), (u64)start, maplen, Perm_Rx);
+  if (R_FAILED(rc)) return -4;
+  armDCacheFlush(dst, len);
+  armICacheInvalidate(dst, len);
+  return 0;
+}
+
 /* Patch RX code through a temporary writable alias. */
 int so_patch_code(void *dst, const void *src, size_t len) {
   uintptr_t start = (uintptr_t)dst & ~0xFFFull;
@@ -1007,7 +1026,7 @@ int so_patch_code(void *dst, const void *src, size_t len) {
   Result rc = svcMapProcessMemory(alias, nx_own_process_handle(), (u64)start, maplen);
   if (R_FAILED(rc)) {
     virtmemLock(); if (rv) virtmemRemoveReservation(rv); virtmemUnlock();
-    return -2;
+    return so_patch_code_direct(dst, src, len);
   }
   memcpy((uint8_t *)alias + off, src, len);
   svcUnmapProcessMemory(alias, nx_own_process_handle(), (u64)start, maplen);

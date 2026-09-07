@@ -1404,24 +1404,42 @@ static void patch_unity_java_class_resolution(void) {
                     GENSHIN_ANDROIDJAVACLASS_CTOR_RVA == UINT64_C(0x2a48c24),
                  "AndroidJavaClass constructor branch displacement changed");
 
-  if (!module_contains(replace_chars, sizeof(expected_replace)) ||
-      !module_contains(generic_call, sizeof(expected_generic)) ||
-      !module_contains(object_consumer, sizeof(*object_consumer)) ||
-      !module_contains(class_consumer, sizeof(*class_consumer)) ||
-      memcmp(replace_chars, expected_replace, sizeof(expected_replace)) ||
-      memcmp(generic_call, expected_generic, sizeof(expected_generic)) ||
-      *object_consumer != expected_consumer ||
-      *class_consumer != expected_consumer)
-    fatal_error("Unity Java class resolver instructions do not match the exact supported client.");
-  if (so_patch_code(replace_chars, patched_replace, sizeof(patched_replace)) ||
-      so_patch_code(generic_call, patched_generic, sizeof(patched_generic)) ||
-      so_patch_code(object_consumer, &patched_consumer, sizeof(patched_consumer)) ||
-      so_patch_code(class_consumer, &patched_consumer, sizeof(patched_consumer)) ||
-      memcmp(replace_chars, patched_replace, sizeof(patched_replace)) ||
-      memcmp(generic_call, patched_generic, sizeof(patched_generic)) ||
-      *object_consumer != patched_consumer ||
-      *class_consumer != patched_consumer)
-    fatal_error("Could not install the exact Unity raw-JNI class resolver patch.");
+  const int pre_replace_ok =
+    module_contains(replace_chars, sizeof(expected_replace)) &&
+    !memcmp(replace_chars, expected_replace, sizeof(expected_replace));
+  const int pre_generic_ok =
+    module_contains(generic_call, sizeof(expected_generic)) &&
+    !memcmp(generic_call, expected_generic, sizeof(expected_generic));
+  const int pre_consumer_ok =
+    module_contains(object_consumer, sizeof(*object_consumer)) &&
+    module_contains(class_consumer, sizeof(*class_consumer)) &&
+    *object_consumer == expected_consumer &&
+    *class_consumer == expected_consumer;
+  if (!pre_replace_ok || !pre_generic_ok || !pre_consumer_ok)
+    fatal_error("Unity Java class resolver instructions do not match the exact supported client (replace=%d generic=%d consumer=%d).",
+                pre_replace_ok, pre_generic_ok, pre_consumer_ok);
+  const int rc_replace =
+    so_patch_code(replace_chars, patched_replace, sizeof(patched_replace));
+  const int rc_generic =
+    so_patch_code(generic_call, patched_generic, sizeof(patched_generic));
+  const int rc_object =
+    so_patch_code(object_consumer, &patched_consumer, sizeof(patched_consumer));
+  const int rc_class =
+    so_patch_code(class_consumer, &patched_consumer, sizeof(patched_consumer));
+  const int post_replace_ok =
+    !memcmp(replace_chars, patched_replace, sizeof(patched_replace));
+  const int post_generic_ok =
+    !memcmp(generic_call, patched_generic, sizeof(patched_generic));
+  const int post_consumer_ok =
+    *object_consumer == patched_consumer &&
+    *class_consumer == patched_consumer;
+  if (rc_replace || rc_generic || rc_object || rc_class ||
+      !post_replace_ok || !post_generic_ok || !post_consumer_ok)
+    fatal_error("Could not install the exact Unity raw-JNI class resolver patch "
+                "(rc replace=%d generic=%d object=%d class=%d, "
+                "verify replace=%d generic=%d consumer=%d).",
+                rc_replace, rc_generic, rc_object, rc_class,
+                post_replace_ok, post_generic_ok, post_consumer_ok);
 }
 
 /* Consumed by unity_slab_dispatch.s after the exact four-instruction selector
