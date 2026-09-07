@@ -10,19 +10,19 @@
  * memory use svcMapPhysicalMemory directly.  Ordinary hbloader forwarders have
  * a zero SystemResourceSize, so the wrapper instead grows a private heap-donor
  * suffix on demand and donates those pages through the same reversible
- * self-process code alias used by the NRO loader.  768 MiB is the smallest
- * value that keeps dlmalloc's HoYoverse-logo engine-init churn in place: at
- * 256 MiB that burst immediately saturated dlmalloc and ratcheted the pinned
- * sbrk-extension (4 MiB donor-backed blocks that never shrink back) while the
- * Unity slab was committing ~100+ 8 MiB chunks, so the donor hit its ceiling
- * mid-burst (fatal 0x1f59 = the donor-allocation-failed sentinel, frame 249).
- * 1024 MiB passed logos but starved the login shader-warmup burst (crash-3:
- * donor capped at 1490 MiB, three NAK ENOMEM panics at from_nir.rs:338).
- * 768 MiB splits the difference: donor capacity becomes ~1746 MiB on the
- * 2930 MiB hbloader grant (+256 MiB over the crash-3 ceiling for the warmup
- * burst) while the logo-time transient stays inside dlmalloc's in-place
- * arena instead of ratcheting donor units away permanently. */
-#define OC_MANAGED_BYTES    ((size_t)768 * 1024 * 1024)
+ * self-process code alias used by the NRO loader.  History: at 256 MiB the
+ * HoYoverse-logo engine-init burst saturated dlmalloc outright (frame 249);
+ * 1024 MiB starved the login shader-warmup donor (crash-3 NAK ENOMEM); 768 MiB
+ * passed both but its donor ceiling (~1746 MiB) sat exactly at the warmup
+ * burst's peak, so every boot became a GC-timing lottery that 10+ runs lost
+ * at 3% (0x1f59 donor-alloc-exhausted).  Since then the 64 KiB large-alloc
+ * threshold routes every mid-size block to the recyclable pool, and full-run
+ * telemetry shows dlmalloc barely touching its arena (sbrk extension 42 MiB,
+ * zero denials), so 512 MiB is now safe: dlmalloc still reaches 768 MiB
+ * effective through the 256 MiB sbrk extension, while the donor ceiling
+ * rises 1:1 to ~2002 MiB and puts the warmup burst's worst observed peak
+ * (~1750 MiB) comfortably inside it. */
+#define OC_MANAGED_BYTES    ((size_t)512 * 1024 * 1024)
 /* The port requires a 39-bit process.  Its shared sparse/dynamic arena is
  * larger than the complete heap-donor backing budget, so the old virtual
  * ceiling cannot precede real donor/process admission.  This is an address-
