@@ -249,6 +249,15 @@ typedef struct {
    * units owned so the exact unmap can be retried; releasing on failure
    * could let a second alias onto still-live source pages. */
   uint64_t backing_unmap_fail_retained;
+  /* The kernel's PhysicalMemoryMax resource limit — the true physical
+   * budget, counting every memory state (TotalMemorySize excludes
+   * CodeMemory-aliased pages such as this broker's donor aliases). */
+  uint64_t resource_limit_bytes;
+  uint64_t resource_used_bytes;
+  /* Burst damper: how many 1 ms spins pool allocations waited inside an
+   * exhaustion window, and how many windows fired. */
+  uint64_t throttle_spins;
+  uint64_t throttle_windows;
 } NxSparseArenaDiagnostics;
 
 typedef enum {

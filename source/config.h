@@ -21,8 +21,12 @@
  * zero denials), so 512 MiB is now safe: dlmalloc still reaches 768 MiB
  * effective through the 256 MiB sbrk extension, while the donor ceiling
  * rises 1:1 to ~2002 MiB and puts the warmup burst's worst observed peak
- * (~1750 MiB) comfortably inside it. */
-#define OC_MANAGED_BYTES    ((size_t)512 * 1024 * 1024)
+ * (~1750 MiB) comfortably inside it.  That fixed the login-page warmup, but
+ * the post-bundle-download warmup (real game shaders) burst past 2002 MiB,
+ * so 384 MiB trades another 128 MiB of staging arena for burst headroom
+ * (ceiling ~2130 MiB) while dlmalloc keeps 640 MiB effective; the burst
+ * damper in the broker now also sheds the burst rate instead of dying. */
+#define OC_MANAGED_BYTES    ((size_t)384 * 1024 * 1024)
 /* The port requires a 39-bit process.  Its shared sparse/dynamic arena is
  * larger than the complete heap-donor backing budget, so the old virtual
  * ceiling cannot precede real donor/process admission.  This is an address-

@@ -2165,6 +2165,16 @@ static uint64_t oc_peak_committed_pages;
 static uint64_t oc_dynamic_mapped_segments;
 static uint64_t oc_peak_dynamic_mapped_segments;
 static uint64_t oc_map_call_count;
+
+/* Burst damper.  When a donor-backed backing map fails from exhaustion the
+ * deadline is pushed ~50 ms into the future; every pool allocation (never a
+ * pthread stack) delays inside that window before walking into the same
+ * failure, so the guest's compile burst sheds rate while its own frees and
+ * GC release donor units.  Deadline is a system tick; 0 = never. */
+static volatile uint64_t g_oc_burst_throttle_until;
+static uint64_t oc_throttle_spins;
+static uint64_t oc_throttle_windows;
+#define OC_BURST_THROTTLE_TICKS (960000u) /* ~50 ms at 19.2 MHz */
 static uint64_t oc_map_retry_count;
 static uint32_t oc_last_map_result;
 /* Code-alias unmap accounting.  Making an AliasCode mapping writable changes
@@ -2853,7 +2863,15 @@ static Result oc_backing_map_locked(void *destination, size_t size,
         }
       }
     } else if (R_FAILED(result)) {
-      sub = encoded ? "source-state" : "donor-alloc-exhausted";
+      if (encoded) {
+        sub = "source-state";
+      } else {
+        sub = "donor-alloc-exhausted";
+        __atomic_store_n(&g_oc_burst_throttle_until,
+                         svcGetSystemTick() + OC_BURST_THROTTLE_TICKS,
+                         __ATOMIC_RELEASE);
+        __atomic_add_fetch(&oc_throttle_windows, 1, __ATOMIC_RELAXED);
+      }
     }
     if (R_FAILED(result) && encoded)
       oc_donor_release_locked(encoded, units);
@@ -3373,6 +3391,19 @@ static void *oc_pool_owned_alloc(size_t size, size_t alignment,
     oc_pool_record_failure(owner);
     return NULL;
   }
+
+  /* Burst damper: backpressure instead of an immediate failure.  Bounded to
+   * ~256 ms per call, never taken with the broker lock held, and skipped for
+   * pthread stacks (the THREAD owner branch above). */
+  unsigned throttle_spins = 0;
+  while (__atomic_load_n(&g_oc_burst_throttle_until, __ATOMIC_ACQUIRE) >
+           svcGetSystemTick() &&
+         throttle_spins < 256) {
+    svcSleepThread(1000);
+    ++throttle_spins;
+  }
+  if (throttle_spins)
+    __atomic_add_fetch(&oc_throttle_spins, throttle_spins, __ATOMIC_RELAXED);
 
   mmap_broker_lock();
   size_t first = 0;
@@ -3929,6 +3960,28 @@ void nx_sparse_arena_get_diagnostics(NxSparseArenaDiagnostics *out) {
                              CUR_PROCESS_HANDLE, 0)))
     out->system_used_memory_bytes = used;
   if (total > used) out->system_available_memory_bytes = total - used;
+  /* The kernel's own accounting.  Unlike TotalMemorySize (which silently
+   * excludes pages committed in non-Normal memory states, such as this
+   * broker's CodeMemory aliases), the PhysicalMemoryMax resource limit sees
+   * every committed page — the real budget the donor competes against. */
+  u64 resource_limit_handle_raw = 0;
+  if (R_SUCCEEDED(svcGetInfo(&resource_limit_handle_raw,
+                             InfoType_ResourceLimit,
+                             CUR_PROCESS_HANDLE, 0)) &&
+      resource_limit_handle_raw != 0) {
+    const Handle resource_limit = (Handle)resource_limit_handle_raw;
+    s64 limit = 0, current = 0;
+    if (R_SUCCEEDED(svcGetResourceLimitLimitValue(
+        &limit, resource_limit, LimitableResource_Memory)))
+      out->resource_limit_bytes = (uint64_t)limit;
+    if (R_SUCCEEDED(svcGetResourceLimitCurrentValue(
+        &current, resource_limit, LimitableResource_Memory)))
+      out->resource_used_bytes = (uint64_t)current;
+    svcCloseHandle(resource_limit);
+  }
+  out->throttle_spins = __atomic_load_n(&oc_throttle_spins, __ATOMIC_RELAXED);
+  out->throttle_windows = __atomic_load_n(&oc_throttle_windows,
+                                          __ATOMIC_RELAXED);
   u64 system_resource = 0;
   if (R_SUCCEEDED(svcGetInfo(&system_resource,
                              InfoType_SystemResourceSizeTotal,

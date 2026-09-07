@@ -2911,11 +2911,16 @@ int main(int argc, char **argv) {
             ? (diag.donor_capacity_bytes - diag.donor_active_bytes) / MiB
             : 0;
         const unsigned long long pool_free = diag.pool_free_bytes;
+        const unsigned long long res_limit =
+          diag.resource_limit_bytes / MiB;
+        const unsigned long long res_used =
+          diag.resource_used_bytes / MiB;
         fprintf(lf,
                 "[I] mem: cap=%lluM head=%lluM pool_free=%lluB "
                 "map=%llu last=0x%x fio_active=%llu oldest=%llums "
                 "slot=%u kind=%u fin=%llu/%llu "
-                "sbrk=%lu ext=%luM denied=%lu\n",
+                "sbrk=%lu ext=%luM denied=%lu "
+                "res=%llu/%lluM thr=%llu/%llu\n",
                 donor_cap, donor_head,
                 (pool_free == UINT64_MAX) ? UINT64_MAX : pool_free,
                 (unsigned long long)diag.map_call_count,
@@ -2929,7 +2934,10 @@ int main(int argc, char **argv) {
                 (unsigned long long)fio.finalize_failures,
                 g_sbrk_extension_count,
                 g_sbrk_extension_bytes / (1024ul * 1024ul),
-                g_sbrk_extension_denied);
+                g_sbrk_extension_denied,
+                res_used, res_limit,
+                (unsigned long long)diag.throttle_spins,
+                (unsigned long long)diag.throttle_windows);
         fprintf(lf,
                 "[I] fio: rd=%lluB/%llu fail=%llu wr=%lluB/%llu fail=%llu "
                 "size=q%llu/h%llu/qfail%llu/ext%llu/efail%llu "
